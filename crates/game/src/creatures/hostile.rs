@@ -2,6 +2,7 @@
 //!
 //! Space-themed hostile creatures that threaten station operations.
 
+use crate::station::rooms::RoomType;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -103,6 +104,34 @@ impl HostileType {
             HostileType::DebrisDrone => "debris_fields",
             HostileType::HullMite => "hull_surfaces",
         }
+    }
+
+    /// Get the station zone (room type) where this creature spawns.
+    ///
+    /// HullMite can spawn in any room but prefers breached rooms.
+    #[must_use]
+    pub fn station_zone_spawn(&self) -> RoomType {
+        match self {
+            HostileType::VoidCrawler => RoomType::Engineering,
+            HostileType::PressureLeech => RoomType::Airlock,
+            HostileType::RadiationWraith => RoomType::PowerCore,
+            HostileType::DebrisDrone => RoomType::Cargo,
+            // HullMite can spawn anywhere, but we return a default
+            // Use prefers_breached_rooms() to check for breach preference
+            HostileType::HullMite => RoomType::Storage,
+        }
+    }
+
+    /// Check if this creature prefers breached rooms.
+    #[must_use]
+    pub fn prefers_breached_rooms(&self) -> bool {
+        matches!(self, HostileType::HullMite)
+    }
+
+    /// Check if this creature can spawn in any room type.
+    #[must_use]
+    pub fn spawns_anywhere(&self) -> bool {
+        matches!(self, HostileType::HullMite)
     }
 }
 
@@ -526,5 +555,52 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.damage, 0);
         assert_eq!(result.effect_duration, 0);
+    }
+
+    // Task 19: Station zone spawn tests
+    #[test]
+    fn test_void_crawler_spawns_engineering() {
+        assert_eq!(HostileType::VoidCrawler.station_zone_spawn(), RoomType::Engineering);
+    }
+
+    #[test]
+    fn test_pressure_leech_spawns_airlock() {
+        assert_eq!(HostileType::PressureLeech.station_zone_spawn(), RoomType::Airlock);
+    }
+
+    #[test]
+    fn test_radiation_wraith_spawns_power_core() {
+        assert_eq!(HostileType::RadiationWraith.station_zone_spawn(), RoomType::PowerCore);
+    }
+
+    #[test]
+    fn test_debris_drone_spawns_cargo() {
+        assert_eq!(HostileType::DebrisDrone.station_zone_spawn(), RoomType::Cargo);
+    }
+
+    #[test]
+    fn test_hull_mite_spawns_anywhere() {
+        assert!(HostileType::HullMite.spawns_anywhere());
+    }
+
+    #[test]
+    fn test_hull_mite_prefers_breached() {
+        assert!(HostileType::HullMite.prefers_breached_rooms());
+    }
+
+    #[test]
+    fn test_other_creatures_dont_prefer_breached() {
+        assert!(!HostileType::VoidCrawler.prefers_breached_rooms());
+        assert!(!HostileType::PressureLeech.prefers_breached_rooms());
+        assert!(!HostileType::RadiationWraith.prefers_breached_rooms());
+        assert!(!HostileType::DebrisDrone.prefers_breached_rooms());
+    }
+
+    #[test]
+    fn test_other_creatures_dont_spawn_anywhere() {
+        assert!(!HostileType::VoidCrawler.spawns_anywhere());
+        assert!(!HostileType::PressureLeech.spawns_anywhere());
+        assert!(!HostileType::RadiationWraith.spawns_anywhere());
+        assert!(!HostileType::DebrisDrone.spawns_anywhere());
     }
 }

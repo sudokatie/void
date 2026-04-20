@@ -4,7 +4,7 @@
 
 mod bulkheads;
 mod hull;
-mod rooms;
+pub mod rooms;
 mod systems;
 
 pub use bulkheads::{Bulkhead, BulkheadState};

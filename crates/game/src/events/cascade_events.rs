@@ -370,6 +370,193 @@ impl CascadeEvent {
     }
 }
 
+/// A multi-step cascade that chains multiple cascade events together.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiStepCascade {
+    /// The cascade events in this chain.
+    events: Vec<CascadeEvent>,
+    /// Index of the currently active event.
+    current_index: usize,
+    /// Whether the entire cascade is complete.
+    complete: bool,
+    /// Delay between cascade steps in seconds.
+    step_delay: f32,
+    /// Time remaining until next step.
+    delay_remaining: f32,
+}
+
+impl MultiStepCascade {
+    /// Create a new multi-step cascade from a list of event types.
+    #[must_use]
+    pub fn new(event_types: Vec<CascadeEventType>, source_room: usize, step_delay: f32) -> Self {
+        let events = event_types
+            .into_iter()
+            .map(|t| CascadeEvent::new(t, source_room))
+            .collect();
+
+        Self {
+            events,
+            current_index: 0,
+            complete: false,
+            step_delay,
+            delay_remaining: 0.0,
+        }
+    }
+
+    /// Create a multi-step cascade with custom events.
+    #[must_use]
+    pub fn with_events(events: Vec<CascadeEvent>, step_delay: f32) -> Self {
+        Self {
+            events,
+            current_index: 0,
+            complete: false,
+            step_delay,
+            delay_remaining: 0.0,
+        }
+    }
+
+    /// Get the number of cascade events in this chain.
+    #[must_use]
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Get the current cascade event.
+    #[must_use]
+    pub fn current_event(&self) -> Option<&CascadeEvent> {
+        self.events.get(self.current_index)
+    }
+
+    /// Get the current cascade event mutably.
+    pub fn current_event_mut(&mut self) -> Option<&mut CascadeEvent> {
+        self.events.get_mut(self.current_index)
+    }
+
+    /// Check if the multi-step cascade is complete.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Get the current step index.
+    #[must_use]
+    pub fn current_step(&self) -> usize {
+        self.current_index
+    }
+
+    /// Get all events in this cascade.
+    #[must_use]
+    pub fn events(&self) -> &[CascadeEvent] {
+        &self.events
+    }
+
+    /// Update the multi-step cascade.
+    ///
+    /// Returns effects triggered this tick and whether a new cascade step started.
+    pub fn tick(&mut self, dt: f32) -> (Vec<CascadeEffect>, bool) {
+        if self.complete || self.events.is_empty() {
+            return (Vec::new(), false);
+        }
+
+        let mut new_step_started = false;
+        let mut all_effects = Vec::new();
+
+        // Process current cascade
+        if let Some(event) = self.events.get_mut(self.current_index) {
+            let effects = event.tick(dt);
+            all_effects.extend(effects);
+
+            // Check if current event is complete
+            if event.is_complete() {
+                self.delay_remaining -= dt;
+
+                // Move to next event after delay
+                if self.delay_remaining <= 0.0 {
+                    self.current_index += 1;
+                    if self.current_index >= self.events.len() {
+                        self.complete = true;
+                    } else {
+                        self.delay_remaining = self.step_delay;
+                        new_step_started = true;
+                    }
+                }
+            }
+        }
+
+        (all_effects, new_step_started)
+    }
+
+    /// Force complete the entire multi-step cascade.
+    pub fn force_complete(&mut self) -> Vec<CascadeEffect> {
+        let mut all_effects = Vec::new();
+
+        for event in &mut self.events {
+            let effects = event.force_complete();
+            all_effects.extend(effects);
+        }
+
+        self.current_index = self.events.len();
+        self.complete = true;
+        all_effects
+    }
+
+    /// Get the total severity of all events combined.
+    #[must_use]
+    pub fn total_severity(&self) -> u32 {
+        self.events.iter().map(|e| e.total_severity()).sum()
+    }
+
+    /// Get the overall progress as a percentage.
+    #[must_use]
+    pub fn overall_progress(&self) -> f32 {
+        if self.events.is_empty() {
+            return 100.0;
+        }
+
+        let completed_steps = self.current_index as f32;
+        let current_progress = self
+            .current_event()
+            .map(|e| e.progress_percent() / 100.0)
+            .unwrap_or(0.0);
+
+        ((completed_steps + current_progress) / self.events.len() as f32) * 100.0
+    }
+}
+
+/// Create a standard multi-step cascade sequence for common scenarios.
+pub fn multi_step_cascade(scenario: &str, source_room: usize) -> MultiStepCascade {
+    match scenario {
+        "reactor_meltdown" => MultiStepCascade::new(
+            vec![
+                CascadeEventType::ReactorDamage,
+                CascadeEventType::ElectricalCascade,
+                CascadeEventType::LifeSupportFailure,
+            ],
+            source_room,
+            5.0,
+        ),
+        "hull_catastrophe" => MultiStepCascade::new(
+            vec![
+                CascadeEventType::HullBreach,
+                CascadeEventType::LifeSupportFailure,
+                CascadeEventType::ElectricalCascade,
+            ],
+            source_room,
+            3.0,
+        ),
+        "fire_cascade" => MultiStepCascade::new(
+            vec![
+                CascadeEventType::FireSpread,
+                CascadeEventType::ElectricalCascade,
+                CascadeEventType::LifeSupportFailure,
+            ],
+            source_room,
+            4.0,
+        ),
+        _ => MultiStepCascade::new(vec![CascadeEventType::ElectricalCascade], source_room, 5.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +810,118 @@ mod tests {
         assert!(event.has_triggered(CascadeEffect::LifeSupportOffline));
 
         assert!(event.is_complete());
+    }
+
+    // Task 21: Multi-step cascade tests
+    #[test]
+    fn test_multi_step_cascade_new() {
+        let cascade = MultiStepCascade::new(
+            vec![CascadeEventType::HullBreach, CascadeEventType::ReactorDamage],
+            0,
+            5.0,
+        );
+        assert_eq!(cascade.event_count(), 2);
+        assert!(!cascade.is_complete());
+        assert_eq!(cascade.current_step(), 0);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_current_event() {
+        let cascade = MultiStepCascade::new(
+            vec![CascadeEventType::HullBreach, CascadeEventType::ReactorDamage],
+            0,
+            5.0,
+        );
+        let current = cascade.current_event().unwrap();
+        assert_eq!(current.trigger(), CascadeEventType::HullBreach);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_tick() {
+        let mut cascade = MultiStepCascade::new(
+            vec![CascadeEventType::HullBreach],
+            0,
+            5.0,
+        );
+        let (effects, _) = cascade.tick(0.1);
+        // HullBreach has Decompression with 0 delay
+        assert!(effects.contains(&CascadeEffect::Decompression));
+    }
+
+    #[test]
+    fn test_multi_step_cascade_force_complete() {
+        let mut cascade = MultiStepCascade::new(
+            vec![CascadeEventType::HullBreach, CascadeEventType::ReactorDamage],
+            0,
+            5.0,
+        );
+        let effects = cascade.force_complete();
+        assert!(cascade.is_complete());
+        assert!(!effects.is_empty());
+    }
+
+    #[test]
+    fn test_multi_step_cascade_total_severity() {
+        let cascade = MultiStepCascade::new(
+            vec![CascadeEventType::HullBreach],
+            0,
+            5.0,
+        );
+        let severity = cascade.total_severity();
+        assert!(severity > 0);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_overall_progress() {
+        let cascade = MultiStepCascade::new(
+            vec![CascadeEventType::HullBreach],
+            0,
+            5.0,
+        );
+        let progress = cascade.overall_progress();
+        assert!((progress - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_reactor_meltdown() {
+        let cascade = multi_step_cascade("reactor_meltdown", 0);
+        assert_eq!(cascade.event_count(), 3);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_hull_catastrophe() {
+        let cascade = multi_step_cascade("hull_catastrophe", 0);
+        assert_eq!(cascade.event_count(), 3);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_fire_cascade() {
+        let cascade = multi_step_cascade("fire_cascade", 0);
+        assert_eq!(cascade.event_count(), 3);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_unknown_scenario() {
+        let cascade = multi_step_cascade("unknown", 0);
+        assert_eq!(cascade.event_count(), 1);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_with_events() {
+        let events = vec![
+            CascadeEvent::new(CascadeEventType::HullBreach, 0),
+            CascadeEvent::new(CascadeEventType::FireSpread, 1),
+        ];
+        let cascade = MultiStepCascade::with_events(events, 3.0);
+        assert_eq!(cascade.event_count(), 2);
+        assert_eq!(cascade.events()[0].source_room(), 0);
+        assert_eq!(cascade.events()[1].source_room(), 1);
+    }
+
+    #[test]
+    fn test_multi_step_cascade_empty() {
+        let cascade = MultiStepCascade::new(Vec::new(), 0, 5.0);
+        assert_eq!(cascade.event_count(), 0);
+        assert!((cascade.overall_progress() - 100.0).abs() < f32::EPSILON);
     }
 }

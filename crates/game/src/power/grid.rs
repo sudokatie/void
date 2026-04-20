@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Default battery capacity.
 const DEFAULT_BATTERY_CAPACITY: f32 = 50.0;
 
+/// Default cascade timing intervals in seconds.
+const DEFAULT_CASCADE_TIMING: [f32; 4] = [2.0, 3.0, 5.0, 8.0];
+
 /// Power grid for the station.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PowerGrid {
@@ -18,6 +21,8 @@ pub struct PowerGrid {
     battery: f32,
     /// Current battery charge.
     battery_charge: f32,
+    /// Room priorities (room_id -> priority, higher = more important).
+    room_priorities: std::collections::HashMap<usize, u32>,
 }
 
 impl Default for PowerGrid {
@@ -35,6 +40,7 @@ impl PowerGrid {
             demand: 0.0,
             battery: DEFAULT_BATTERY_CAPACITY,
             battery_charge: DEFAULT_BATTERY_CAPACITY,
+            room_priorities: std::collections::HashMap::new(),
         }
     }
 
@@ -151,6 +157,41 @@ impl PowerGrid {
     /// Set battery charge directly (for testing).
     pub fn set_battery_charge(&mut self, charge: f32) {
         self.battery_charge = charge.clamp(0.0, self.battery);
+    }
+
+    /// Get cascade timing intervals (seconds between each shutdown step).
+    ///
+    /// Returns timing for progressive system shutdown during power failure.
+    #[must_use]
+    pub fn cascade_timing() -> Vec<f32> {
+        DEFAULT_CASCADE_TIMING.to_vec()
+    }
+
+    /// Override priority for a specific room.
+    ///
+    /// Higher priority rooms are shut down last during power failures.
+    /// Returns true if the priority was set, false if invalid.
+    pub fn priority_override(&mut self, room_id: usize, new_priority: u32) -> bool {
+        self.room_priorities.insert(room_id, new_priority);
+        true
+    }
+
+    /// Get the priority for a room.
+    ///
+    /// Returns 0 (lowest) if no priority has been set.
+    #[must_use]
+    pub fn get_room_priority(&self, room_id: usize) -> u32 {
+        self.room_priorities.get(&room_id).copied().unwrap_or(0)
+    }
+
+    /// Get all rooms sorted by priority (lowest priority first).
+    ///
+    /// Rooms with lower priority are shut down first during cascade failures.
+    #[must_use]
+    pub fn rooms_by_shutdown_order(&self) -> Vec<usize> {
+        let mut rooms: Vec<_> = self.room_priorities.iter().collect();
+        rooms.sort_by_key(|entry| *entry.1);
+        rooms.into_iter().map(|entry| *entry.0).collect()
     }
 }
 
@@ -324,5 +365,71 @@ mod tests {
     fn test_power_grid_default() {
         let grid = PowerGrid::default();
         assert!((grid.battery_capacity() - 50.0).abs() < f32::EPSILON);
+    }
+
+    // Task 21: Cascade timing tests
+    #[test]
+    fn test_cascade_timing_returns_values() {
+        let timing = PowerGrid::cascade_timing();
+        assert!(!timing.is_empty());
+        assert_eq!(timing.len(), 4);
+    }
+
+    #[test]
+    fn test_cascade_timing_values() {
+        let timing = PowerGrid::cascade_timing();
+        assert!((timing[0] - 2.0).abs() < f32::EPSILON);
+        assert!((timing[1] - 3.0).abs() < f32::EPSILON);
+        assert!((timing[2] - 5.0).abs() < f32::EPSILON);
+        assert!((timing[3] - 8.0).abs() < f32::EPSILON);
+    }
+
+    // Task 21: Priority override tests
+    #[test]
+    fn test_priority_override_sets_priority() {
+        let mut grid = PowerGrid::new();
+        assert!(grid.priority_override(0, 10));
+        assert_eq!(grid.get_room_priority(0), 10);
+    }
+
+    #[test]
+    fn test_priority_override_multiple_rooms() {
+        let mut grid = PowerGrid::new();
+        grid.priority_override(0, 5);
+        grid.priority_override(1, 10);
+        grid.priority_override(2, 3);
+
+        assert_eq!(grid.get_room_priority(0), 5);
+        assert_eq!(grid.get_room_priority(1), 10);
+        assert_eq!(grid.get_room_priority(2), 3);
+    }
+
+    #[test]
+    fn test_get_room_priority_default() {
+        let grid = PowerGrid::new();
+        assert_eq!(grid.get_room_priority(999), 0);
+    }
+
+    #[test]
+    fn test_rooms_by_shutdown_order() {
+        let mut grid = PowerGrid::new();
+        grid.priority_override(0, 10);
+        grid.priority_override(1, 5);
+        grid.priority_override(2, 15);
+
+        let order = grid.rooms_by_shutdown_order();
+        assert_eq!(order.len(), 3);
+        // Lowest priority first (1=5, 0=10, 2=15)
+        assert_eq!(order[0], 1);
+        assert_eq!(order[1], 0);
+        assert_eq!(order[2], 2);
+    }
+
+    #[test]
+    fn test_priority_override_updates_existing() {
+        let mut grid = PowerGrid::new();
+        grid.priority_override(0, 5);
+        grid.priority_override(0, 20);
+        assert_eq!(grid.get_room_priority(0), 20);
     }
 }

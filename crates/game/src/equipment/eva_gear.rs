@@ -119,6 +119,40 @@ impl EVAGear {
     pub fn requires_power(&self) -> bool {
         matches!(self, EVAGear::ThrusterPack | EVAGear::WeldingTorch | EVAGear::Multitool)
     }
+
+    /// Get the standard durability (100 for all gear types).
+    #[must_use]
+    pub fn standard_durability(&self) -> f32 {
+        100.0
+    }
+
+    /// Get the standard degradation per use (0.5 for all gear types).
+    #[must_use]
+    pub fn degradation_per_use(&self) -> f32 {
+        0.5
+    }
+
+    /// Get O2 duration in minutes for suit-type gear.
+    ///
+    /// Returns 60 minutes for EVASuit, None (0.0) for other gear.
+    #[must_use]
+    pub fn suit_o2_duration(&self) -> f32 {
+        match self {
+            EVAGear::EVASuit => 60.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Get thruster fuel capacity.
+    ///
+    /// Returns 100 for ThrusterPack, 0 for other gear.
+    #[must_use]
+    pub fn thruster_fuel_capacity(&self) -> f32 {
+        match self {
+            EVAGear::ThrusterPack => 100.0,
+            _ => 0.0,
+        }
+    }
 }
 
 /// An instance of EVA equipment.
@@ -482,5 +516,60 @@ mod tests {
             assert!(equip.use_equipment());
         }
         assert!(equip.is_broken());
+    }
+
+    // Task 20: Standard durability tests
+    #[test]
+    fn test_standard_durability_all_gear() {
+        for gear in EVAGear::all() {
+            assert!((gear.standard_durability() - 100.0).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_degradation_per_use_all_gear() {
+        for gear in EVAGear::all() {
+            assert!((gear.degradation_per_use() - 0.5).abs() < f32::EPSILON);
+        }
+    }
+
+    // Task 20: O2 duration tests
+    #[test]
+    fn test_eva_suit_o2_duration() {
+        assert!((EVAGear::EVASuit.suit_o2_duration() - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_thruster_pack_no_o2_duration() {
+        assert!((EVAGear::ThrusterPack.suit_o2_duration() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_non_suit_gear_no_o2_duration() {
+        assert!((EVAGear::PatchKit.suit_o2_duration() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::WeldingTorch.suit_o2_duration() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::O2Canister.suit_o2_duration() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::Multitool.suit_o2_duration() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::TetherLine.suit_o2_duration() - 0.0).abs() < f32::EPSILON);
+    }
+
+    // Task 20: Thruster fuel capacity tests
+    #[test]
+    fn test_thruster_pack_fuel_capacity() {
+        assert!((EVAGear::ThrusterPack.thruster_fuel_capacity() - 100.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_eva_suit_no_fuel_capacity() {
+        assert!((EVAGear::EVASuit.thruster_fuel_capacity() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_non_thruster_gear_no_fuel() {
+        assert!((EVAGear::PatchKit.thruster_fuel_capacity() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::WeldingTorch.thruster_fuel_capacity() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::O2Canister.thruster_fuel_capacity() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::Multitool.thruster_fuel_capacity() - 0.0).abs() < f32::EPSILON);
+        assert!((EVAGear::TetherLine.thruster_fuel_capacity() - 0.0).abs() < f32::EPSILON);
     }
 }

@@ -2,6 +2,7 @@
 //!
 //! Harmless space creatures that provide useful resources.
 
+use crate::station::rooms::RoomType;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -91,6 +92,27 @@ impl PassiveType {
             PassiveType::DustBunny => "camouflage",
             PassiveType::StarCrab => "armored",
         }
+    }
+
+    /// Get the room type where this creature spawns.
+    ///
+    /// StarCrab is exterior only - returns None since it spawns outside the station.
+    #[must_use]
+    pub fn spawn_condition(&self) -> Option<RoomType> {
+        match self {
+            PassiveType::CircuitMoth => Some(RoomType::Command),
+            PassiveType::CoolantFish => Some(RoomType::LifeSupport),
+            PassiveType::SporeBloom => Some(RoomType::Hydroponics),
+            PassiveType::DustBunny => Some(RoomType::Storage),
+            // StarCrab spawns on exterior hull only, not inside any room
+            PassiveType::StarCrab => None,
+        }
+    }
+
+    /// Check if this creature spawns on the exterior (outside station).
+    #[must_use]
+    pub fn is_exterior_only(&self) -> bool {
+        matches!(self, PassiveType::StarCrab)
     }
 }
 
@@ -404,6 +426,50 @@ mod tests {
                     assert_ne!(drop, other, "Duplicate drop items found");
                 }
             }
+        }
+    }
+
+    // Task 19: Spawn condition tests
+    #[test]
+    fn test_circuit_moth_spawns_command() {
+        assert_eq!(PassiveType::CircuitMoth.spawn_condition(), Some(RoomType::Command));
+    }
+
+    #[test]
+    fn test_coolant_fish_spawns_life_support() {
+        assert_eq!(PassiveType::CoolantFish.spawn_condition(), Some(RoomType::LifeSupport));
+    }
+
+    #[test]
+    fn test_spore_bloom_spawns_hydroponics() {
+        assert_eq!(PassiveType::SporeBloom.spawn_condition(), Some(RoomType::Hydroponics));
+    }
+
+    #[test]
+    fn test_dust_bunny_spawns_storage() {
+        assert_eq!(PassiveType::DustBunny.spawn_condition(), Some(RoomType::Storage));
+    }
+
+    #[test]
+    fn test_star_crab_exterior_only() {
+        assert_eq!(PassiveType::StarCrab.spawn_condition(), None);
+        assert!(PassiveType::StarCrab.is_exterior_only());
+    }
+
+    #[test]
+    fn test_interior_creatures_not_exterior() {
+        assert!(!PassiveType::CircuitMoth.is_exterior_only());
+        assert!(!PassiveType::CoolantFish.is_exterior_only());
+        assert!(!PassiveType::SporeBloom.is_exterior_only());
+        assert!(!PassiveType::DustBunny.is_exterior_only());
+    }
+
+    #[test]
+    fn test_all_creatures_have_spawn_condition_or_exterior() {
+        for creature_type in PassiveType::all() {
+            let has_interior = creature_type.spawn_condition().is_some();
+            let is_exterior = creature_type.is_exterior_only();
+            assert!(has_interior || is_exterior, "Creature {:?} has no spawn location", creature_type);
         }
     }
 }
