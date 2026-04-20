@@ -1,0 +1,18 @@
+[package]
+name = "engine_physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Physics system for the Lattice game engine"
+
+[dependencies]
+engine_core = { path = "../engine_core" }
+glam.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true
