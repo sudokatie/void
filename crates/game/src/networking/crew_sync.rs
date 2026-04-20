@@ -5,6 +5,79 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+/// Crew role assignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrewRole {
+    /// Captain - coordinates crew, can override bulkhead seals.
+    Captain,
+    /// Engineer - repairs hull breaches, manages power grid.
+    Engineer,
+    /// Medic - treats injuries, manages medical bay.
+    Medic,
+    /// Pilot - navigates station, manages EVA operations.
+    Pilot,
+}
+
+impl CrewRole {
+    /// Get the role name as a string.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            CrewRole::Captain => "Captain",
+            CrewRole::Engineer => "Engineer",
+            CrewRole::Medic => "Medic",
+            CrewRole::Pilot => "Pilot",
+        }
+    }
+
+    /// Get the priority level for role-based UI ordering.
+    #[must_use]
+    pub fn priority(&self) -> u8 {
+        match self {
+            CrewRole::Captain => 0,
+            CrewRole::Engineer => 1,
+            CrewRole::Medic => 2,
+            CrewRole::Pilot => 3,
+        }
+    }
+
+    /// Check if this role can override bulkhead seals.
+    #[must_use]
+    pub fn can_seal_bulkhead(&self) -> bool {
+        matches!(self, CrewRole::Captain | CrewRole::Engineer)
+    }
+
+    /// Check if this role can operate the medical bay.
+    #[must_use]
+    pub fn can_operate_medbay(&self) -> bool {
+        matches!(self, CrewRole::Medic | CrewRole::Captain)
+    }
+
+    /// Check if this role can authorize EVA.
+    #[must_use]
+    pub fn can_authorize_eva(&self) -> bool {
+        matches!(self, CrewRole::Captain | CrewRole::Pilot)
+    }
+
+    /// Check if this role can reroute power.
+    #[must_use]
+    pub fn can_reroute_power(&self) -> bool {
+        matches!(self, CrewRole::Engineer | CrewRole::Captain)
+    }
+}
+
+impl std::fmt::Display for CrewRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+impl Default for CrewRole {
+    fn default() -> Self {
+        CrewRole::Pilot
+    }
+}
+
 /// Crew member position and orientation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CrewPosition {
@@ -70,6 +143,8 @@ pub struct CrewState {
     pub player_id: u64,
     /// Player name.
     pub name: String,
+    /// Crew role.
+    pub role: CrewRole,
     /// Position and orientation.
     pub position: CrewPosition,
     /// Vital signs.
@@ -91,6 +166,7 @@ impl CrewState {
         Self {
             player_id,
             name,
+            role: CrewRole::Pilot,
             position: CrewPosition::default(),
             vitals: CrewVitals::default(),
             equipment: CrewEquipment::default(),
@@ -98,6 +174,28 @@ impl CrewState {
             current_room: None,
             sequence: 0,
         }
+    }
+
+    /// Create a new crew state with a specific role.
+    #[must_use]
+    pub fn with_role(player_id: u64, name: String, role: CrewRole) -> Self {
+        Self {
+            player_id,
+            name,
+            role,
+            position: CrewPosition::default(),
+            vitals: CrewVitals::default(),
+            equipment: CrewEquipment::default(),
+            in_eva: false,
+            current_room: None,
+            sequence: 0,
+        }
+    }
+
+    /// Assign a new role.
+    pub fn assign_role(&mut self, role: CrewRole) {
+        self.role = role;
+        self.sequence += 1;
     }
 
     /// Update position.
@@ -420,5 +518,80 @@ mod tests {
         sync.get_mut(1).unwrap().vitals.health = 20.0;
 
         assert_eq!(sync.crew_needing_help().len(), 1);
+    }
+
+    #[test]
+    fn test_crew_role_name() {
+        assert_eq!(CrewRole::Captain.name(), "Captain");
+        assert_eq!(CrewRole::Engineer.name(), "Engineer");
+        assert_eq!(CrewRole::Medic.name(), "Medic");
+        assert_eq!(CrewRole::Pilot.name(), "Pilot");
+    }
+
+    #[test]
+    fn test_crew_role_display() {
+        assert_eq!(format!("{}", CrewRole::Captain), "Captain");
+    }
+
+    #[test]
+    fn test_crew_role_priority() {
+        assert!(CrewRole::Captain.priority() < CrewRole::Engineer.priority());
+        assert!(CrewRole::Engineer.priority() < CrewRole::Medic.priority());
+        assert!(CrewRole::Medic.priority() < CrewRole::Pilot.priority());
+    }
+
+    #[test]
+    fn test_crew_role_permissions() {
+        assert!(CrewRole::Captain.can_seal_bulkhead());
+        assert!(CrewRole::Engineer.can_seal_bulkhead());
+        assert!(!CrewRole::Medic.can_seal_bulkhead());
+        assert!(!CrewRole::Pilot.can_seal_bulkhead());
+
+        assert!(CrewRole::Captain.can_operate_medbay());
+        assert!(CrewRole::Medic.can_operate_medbay());
+        assert!(!CrewRole::Engineer.can_operate_medbay());
+
+        assert!(CrewRole::Captain.can_authorize_eva());
+        assert!(CrewRole::Pilot.can_authorize_eva());
+        assert!(!CrewRole::Engineer.can_authorize_eva());
+
+        assert!(CrewRole::Captain.can_reroute_power());
+        assert!(CrewRole::Engineer.can_reroute_power());
+        assert!(!CrewRole::Medic.can_reroute_power());
+    }
+
+    #[test]
+    fn test_crew_state_with_role() {
+        let state = CrewState::with_role(1, "Engineer1".to_string(), CrewRole::Engineer);
+        assert_eq!(state.role, CrewRole::Engineer);
+    }
+
+    #[test]
+    fn test_crew_state_assign_role() {
+        let mut state = CrewState::new(1, "Player1".to_string());
+        assert_eq!(state.role, CrewRole::Pilot); // default
+
+        state.assign_role(CrewRole::Captain);
+        assert_eq!(state.role, CrewRole::Captain);
+        assert_eq!(state.sequence, 1);
+    }
+
+    #[test]
+    fn test_crew_role_default() {
+        assert_eq!(CrewRole::default(), CrewRole::Pilot);
+    }
+
+    #[test]
+    fn test_crew_role_serialization() {
+        let state = CrewState::with_role(1, "Captain1".to_string(), CrewRole::Captain);
+        let data = CrewSync::serialize(&state);
+        let restored = CrewSync::deserialize(&data).unwrap();
+        assert_eq!(restored.role, CrewRole::Captain);
+    }
+
+    #[test]
+    fn test_crew_role_equality() {
+        assert_eq!(CrewRole::Captain, CrewRole::Captain);
+        assert_ne!(CrewRole::Captain, CrewRole::Engineer);
     }
 }
