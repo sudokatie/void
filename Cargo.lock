@@ -357,43 +357,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cascade_game"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "engine_ai",
- "engine_audio",
- "engine_core",
- "engine_network",
- "engine_physics",
- "engine_render",
- "engine_ui",
- "engine_world",
- "glam",
- "hecs",
- "ron",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "cascade_server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "engine_ai",
- "engine_core",
- "engine_network",
- "engine_world",
- "glam",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3591,6 +3554,43 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "void_game"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "engine_ai",
+ "engine_audio",
+ "engine_core",
+ "engine_network",
+ "engine_physics",
+ "engine_render",
+ "engine_ui",
+ "engine_world",
+ "glam",
+ "hecs",
+ "ron",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "void_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "engine_ai",
+ "engine_core",
+ "engine_network",
+ "engine_world",
+ "glam",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "walkdir"
