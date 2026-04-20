@@ -179,10 +179,10 @@ impl RandomEvent {
         self.active
     }
 
-    /// Check if the event has finished.
+    /// Check if the event has finished (was active and completed).
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.active && self.remaining_duration <= 0.0
+        !self.active && self.remaining_duration <= 0.0
     }
 
     /// Get intensity multiplier.

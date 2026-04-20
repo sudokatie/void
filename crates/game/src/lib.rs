@@ -10,6 +10,7 @@ pub mod creatures;
 pub mod ecs;
 pub mod entities;
 pub mod equipment;
+pub mod events;
 pub mod inventory;
 pub mod networking;
 pub mod power;

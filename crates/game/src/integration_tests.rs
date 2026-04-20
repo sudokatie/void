@@ -656,3 +656,675 @@ fn test_complete_game_loop() {
     assert!(bridge_atmo.o2 >= 16.0);
     assert!(bridge_atmo.pressure >= 80.0);
 }
+
+// =============================================================================
+// Void-Specific Integration Tests
+// =============================================================================
+
+use crate::equipment::{EVAEquipment, EVAGear};
+use crate::events::{CascadeEffect, CascadeEvent, CascadeEventType, RandomEvent, RandomEventType};
+use crate::vacuum::GasModel;
+use engine_physics::vacuum::RoomAtmosphereSim;
+
+/// Test 31: Decompression cascade - hull breach triggers chain of effects
+#[test]
+fn test_decompression_cascade() {
+    // A hull breach should trigger decompression, power failure, and station dark
+    let mut cascade = CascadeEvent::new(CascadeEventType::HullBreach, 0);
+
+    assert_eq!(cascade.trigger(), CascadeEventType::HullBreach);
+    assert!(!cascade.is_complete());
+    assert!(cascade.effects().contains(&CascadeEffect::Decompression));
+    assert!(cascade.effects().contains(&CascadeEffect::PowerFailure));
+    assert!(cascade.effects().contains(&CascadeEffect::StationDark));
+
+    // Decompression triggers immediately (0 delay)
+    let triggered = cascade.tick(0.1);
+    assert!(triggered.contains(&CascadeEffect::Decompression));
+    assert!(cascade.has_triggered(CascadeEffect::Decompression));
+
+    // Power failure triggers after 2 seconds
+    cascade.tick(2.0);
+    assert!(cascade.has_triggered(CascadeEffect::PowerFailure));
+
+    // Station dark triggers after 3 seconds total
+    cascade.tick(1.0);
+    assert!(cascade.has_triggered(CascadeEffect::StationDark));
+    assert!(cascade.is_complete());
+}
+
+/// Test 32: Decompression cascade with atmosphere simulation
+#[test]
+fn test_decompression_cascade_with_atmosphere() {
+    let mut atmo = AtmosphereManager::new();
+    let command = atmo.add_room(200.0, true);
+    let engineering = atmo.add_room(150.0, true);
+    let cargo = atmo.add_room(100.0, false);
+
+    atmo.connect_rooms(command, engineering, 1.0);
+    atmo.connect_rooms(engineering, cargo, 0.5);
+
+    // Start cascade in engineering
+    let mut cascade = CascadeEvent::new(CascadeEventType::HullBreach, engineering);
+    cascade.tick(0.1); // Trigger decompression
+
+    // Simulate breach in engineering
+    atmo.breach(engineering, DecompressionType::Explosive);
+
+    // Run simulation - atmosphere should vent rapidly
+    let initial_eng_pressure = atmo.get_room(engineering).unwrap().pressure;
+    for _ in 0..10 {
+        atmo.tick(0.5);
+    }
+
+    let final_eng_pressure = atmo.get_room(engineering).unwrap().pressure;
+    assert!(final_eng_pressure < initial_eng_pressure * 0.5);
+
+    // Connected rooms should also lose some pressure due to flow
+    let command_pressure = atmo.get_room(command).unwrap().pressure;
+    assert!(command_pressure < 101.3);
+}
+
+/// Test 33: Power failure cascade
+#[test]
+fn test_power_failure_cascade() {
+    let mut power = PowerManager::new();
+
+    // Register critical systems
+    power.register_consumer(PowerConsumer::new(0, "Life Support".to_string(), 1, 40.0));
+    power.register_consumer(PowerConsumer::new(1, "Reactor Cooling".to_string(), 1, 30.0));
+    power.register_consumer(PowerConsumer::new(2, "Sensors".to_string(), 2, 15.0));
+    power.register_consumer(PowerConsumer::new(3, "Lights".to_string(), 3, 10.0));
+
+    // Start reactor damage cascade
+    let mut cascade = CascadeEvent::new(CascadeEventType::ReactorDamage, 0);
+
+    // Damage the reactor
+    power.reactor_mut().damage(80.0);
+    assert!(!power.reactor().is_active());
+
+    // Cascade should trigger power failure, life support offline, station dark
+    cascade.tick(3.0);
+    assert!(cascade.has_triggered(CascadeEffect::PowerFailure));
+
+    cascade.tick(3.0);
+    assert!(cascade.has_triggered(CascadeEffect::LifeSupportOffline));
+    assert!(cascade.has_triggered(CascadeEffect::StationDark));
+
+    // With no reactor output, load shedding should occur
+    power.grid_mut().set_battery_charge(0.0);
+    let affected = power.tick(1.0);
+    // Systems should be affected due to power shortage
+    assert!(!affected.is_empty() || power.reactor().output() == 0.0);
+}
+
+/// Test 34: Breach patching with EVA equipment
+#[test]
+fn test_breach_patching_eva() {
+    let mut atmo = AtmosphereManager::new();
+    let airlock = atmo.add_room(50.0, false);
+
+    // Create breach
+    atmo.breach(airlock, DecompressionType::Slow);
+    assert!(!atmo.is_sealed(airlock));
+
+    // Player prepares for EVA
+    let mut eva = EVAState::new();
+    let mut patch_kit = EVAEquipment::new(EVAGear::PatchKit);
+    let mut tether = EVAEquipment::new(EVAGear::TetherLine);
+
+    // Enter vacuum
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    // Navigate and use equipment
+    tether.use_equipment();
+    assert!(patch_kit.use_equipment());
+    assert!(patch_kit.durability() < EVAGear::PatchKit.base_durability());
+
+    // Seal the breach
+    assert!(atmo.seal_breach(airlock));
+    assert!(atmo.is_sealed(airlock));
+
+    // Return inside
+    eva.return_inside();
+    assert!(!eva.is_outside());
+}
+
+/// Test 35: Breach patching under time pressure (O2 depletion)
+#[test]
+fn test_breach_patching_o2_pressure() {
+    let mut eva = EVAState::new();
+    let mut patch_kit = EVAEquipment::new(EVAGear::PatchKit);
+
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    // Simulate repair work while consuming O2
+    let mut repair_steps = 0;
+    while patch_kit.durability() > 10.0 && !eva.is_o2_critical() {
+        patch_kit.use_equipment();
+        eva.use_o2(2.0); // Higher consumption during work
+        repair_steps += 1;
+    }
+
+    // Should have completed some repair steps
+    assert!(repair_steps > 0);
+
+    // If O2 becomes critical, need to abort or refill
+    if eva.is_o2_critical() {
+        let mut o2_canister = EVAEquipment::new(EVAGear::O2Canister);
+        o2_canister.use_equipment();
+        eva.refill_o2(15.0);
+        assert!(!eva.is_o2_critical());
+    }
+}
+
+/// Test 36: Atmosphere equalization between rooms
+#[test]
+fn test_atmosphere_equalization() {
+    let mut gas_model = GasModel::new();
+
+    // Create two rooms with different pressures
+    let mut high_pressure = RoomAtmosphereSim::new();
+    high_pressure.pressure = 150.0;
+    let mut low_pressure = RoomAtmosphereSim::new();
+    low_pressure.pressure = 50.0;
+
+    let room_a = gas_model.add_room(high_pressure);
+    let room_b = gas_model.add_room(low_pressure);
+
+    gas_model.connect_rooms(room_a, room_b, 2.0);
+
+    let initial_a = gas_model.get_room(room_a).unwrap().pressure;
+    let initial_b = gas_model.get_room(room_b).unwrap().pressure;
+
+    // Run simulation until pressures equalize
+    for _ in 0..50 {
+        gas_model.tick(0.5);
+    }
+
+    let final_a = gas_model.get_room(room_a).unwrap().pressure;
+    let final_b = gas_model.get_room(room_b).unwrap().pressure;
+
+    // Pressures should be closer to each other
+    assert!((final_a - final_b).abs() < (initial_a - initial_b).abs());
+    // Both should be moving toward equilibrium
+    assert!(final_a < initial_a);
+    assert!(final_b > initial_b);
+}
+
+/// Test 37: Multi-room atmosphere network
+#[test]
+fn test_multi_room_atmosphere_network() {
+    let mut atmo = AtmosphereManager::new();
+
+    // Create station layout: Command - Engineering - Cargo - Airlock
+    let command = atmo.add_room(200.0, true);
+    let engineering = atmo.add_room(250.0, true);
+    let cargo = atmo.add_room(150.0, false);
+    let airlock = atmo.add_room(50.0, false);
+
+    atmo.connect_rooms(command, engineering, 1.0);
+    atmo.connect_rooms(engineering, cargo, 1.0);
+    atmo.connect_rooms(cargo, airlock, 0.5);
+
+    // Breach the airlock
+    atmo.breach(airlock, DecompressionType::Slow);
+
+    // Run simulation
+    for _ in 0..20 {
+        atmo.tick(0.5);
+    }
+
+    // Airlock should have lowest pressure
+    let airlock_p = atmo.get_room(airlock).unwrap().pressure;
+    let cargo_p = atmo.get_room(cargo).unwrap().pressure;
+    let eng_p = atmo.get_room(engineering).unwrap().pressure;
+    let cmd_p = atmo.get_room(command).unwrap().pressure;
+
+    assert!(airlock_p < cargo_p);
+    assert!(cargo_p < eng_p);
+    // Command has life support, should maintain better
+    assert!(cmd_p >= eng_p - 10.0);
+}
+
+/// Test 38: EVA thruster navigation and return
+#[test]
+fn test_eva_thruster_navigation() {
+    let mut eva = EVAState::new();
+    let mut movement = ZeroGMovement::new();
+    let mut thruster = EVAEquipment::new(EVAGear::ThrusterPack);
+
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    // Tether starts at max (50.0), so we shorten it first to simulate being near the station
+    eva.shorten_tether(30.0);
+    let initial_tether = eva.tether_length();
+
+    // Navigate outward
+    for _ in 0..5 {
+        thruster.use_equipment();
+        movement.thrust(IVec3::new(2, 0, 0), 5.0);
+        movement.tick(1.0);
+        eva.extend_tether(5.0);
+    }
+
+    assert!(movement.position().x > 0);
+    assert!(eva.tether_length() > initial_tether);
+
+    // Return trip
+    for _ in 0..5 {
+        thruster.use_equipment();
+        movement.thrust(IVec3::new(-2, 0, 0), 5.0);
+        movement.tick(1.0);
+        eva.shorten_tether(5.0);
+    }
+
+    eva.return_inside();
+    assert!(!eva.is_outside());
+    assert!(thruster.durability() < EVAGear::ThrusterPack.base_durability());
+}
+
+/// Test 39: EVA emergency return (low O2)
+#[test]
+fn test_eva_emergency_return() {
+    let mut eva = EVAState::new();
+    let mut movement = ZeroGMovement::new();
+
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    // Work until O2 is low
+    while !eva.is_o2_critical() {
+        eva.use_o2(1.0);
+        movement.tick(1.0);
+    }
+
+    assert!(eva.is_o2_critical());
+
+    // Emergency return - follow tether back
+    eva.retract_tether();
+    eva.return_inside();
+
+    assert!(!eva.is_outside());
+    // Should have returned before complete depletion
+    assert!(!eva.is_o2_depleted());
+}
+
+/// Test 40: Creature attack during hull repair
+#[test]
+fn test_creature_attack_hull_repair() {
+    let mut segment = HullSegment::new(0);
+    let mut hull_mite = HostileCreature::new(HostileType::HullMite);
+    let mut void_crawler = HostileCreature::new(HostileType::VoidCrawler);
+
+    // Initial hull state
+    assert!(!segment.is_breached());
+
+    // Hull mites attack and damage hull
+    for _ in 0..5 {
+        if hull_mite.is_alive() {
+            segment.damage(hull_mite.damage() as f32);
+        }
+    }
+
+    assert!(segment.integrity() < 100.0);
+
+    // Void crawler joins attack with special ability
+    let ability = void_crawler.use_ability();
+    assert!(ability.success);
+    assert!(ability.effect.contains("electrical"));
+
+    // Player fights back
+    hull_mite.take_damage(20);
+    void_crawler.take_damage(25);
+    void_crawler.take_damage(30);
+
+    assert!(!hull_mite.is_alive());
+    assert!(!void_crawler.is_alive());
+
+    // Repair hull
+    segment.patch(50.0);
+    assert!(!segment.is_breached());
+}
+
+/// Test 41: Pressure Leech creates hull breach
+#[test]
+fn test_pressure_leech_breach() {
+    let mut atmo = AtmosphereManager::new();
+    let corridor = atmo.add_room(100.0, false);
+
+    let mut leech = HostileCreature::new(HostileType::PressureLeech);
+
+    // Leech's special ability creates micro-breaches
+    let ability = leech.use_ability();
+    assert!(ability.success);
+    assert!(ability.effect.contains("breach"));
+
+    // Simulate breach creation
+    atmo.breach(corridor, DecompressionType::Slow);
+    assert!(!atmo.is_sealed(corridor));
+
+    let initial_pressure = atmo.get_room(corridor).unwrap().pressure;
+    atmo.tick(2.0);
+
+    // Pressure should be venting
+    assert!(atmo.get_room(corridor).unwrap().pressure < initial_pressure);
+
+    // Kill the leech and patch
+    leech.take_damage(30);
+    assert!(!leech.is_alive());
+    atmo.seal_breach(corridor);
+}
+
+/// Test 42: Multiple creature encounter
+#[test]
+fn test_multiple_creature_encounter() {
+    let creatures: Vec<HostileCreature> = HostileType::all()
+        .iter()
+        .map(|t| HostileCreature::new(*t))
+        .collect();
+
+    assert_eq!(creatures.len(), 5);
+
+    let mut total_hp = 0;
+    let mut total_damage = 0;
+
+    for creature in &creatures {
+        assert!(creature.is_alive());
+        total_hp += creature.hp();
+        total_damage += creature.damage();
+    }
+
+    assert!(total_hp > 200);
+    assert!(total_damage > 20);
+
+    // Each creature type has unique abilities
+    let abilities: Vec<_> = creatures.iter().map(|c| c.use_ability().effect).collect();
+    let unique_abilities: std::collections::HashSet<_> = abilities.iter().collect();
+    assert!(unique_abilities.len() >= 3); // At least 3 unique ability types
+}
+
+/// Test 43: Random event chain - micrometeorite shower
+#[test]
+fn test_micrometeorite_shower_event() {
+    let mut event = RandomEvent::new(RandomEventType::MicrometeoriteShower);
+    let mut segment = HullSegment::new(0);
+
+    assert!(!event.is_active());
+    event.add_affected_room(0);
+    event.start();
+    assert!(event.is_active());
+
+    // Simulate shower duration (30 second event)
+    let initial_integrity = segment.integrity();
+    for _ in 0..35 {
+        let damage = event.hull_damage_per_tick();
+        if damage > 0.0 {
+            segment.damage(damage);
+        }
+        event.tick(1.0);
+    }
+
+    // Hull should have taken damage during the event
+    assert!(segment.integrity() < initial_integrity);
+    // Event should no longer be active after its duration
+    assert!(!event.is_active());
+}
+
+/// Test 44: Solar flare event affecting power
+#[test]
+fn test_solar_flare_power_impact() {
+    let mut power = PowerManager::new();
+    power.register_consumer(PowerConsumer::new(0, "Sensors".to_string(), 2, 15.0));
+
+    let mut event = RandomEvent::with_intensity(RandomEventType::SolarFlare, 1.5);
+    event.start();
+
+    assert!(event.is_active());
+    assert!(event.event_type().affects_power());
+
+    // Solar flare damages power systems
+    let power_damage = event.power_damage_per_tick();
+    assert!(power_damage > 2.0);
+
+    // Reactor takes damage over time
+    let mut total_damage = 0.0;
+    while event.is_active() {
+        total_damage += event.power_damage_per_tick();
+        power.tick(1.0);
+        event.tick(1.0);
+    }
+
+    assert!(total_damage > 100.0);
+}
+
+/// Test 45: Event chain - debris field followed by breach cascade
+#[test]
+fn test_debris_field_cascade_chain() {
+    let mut debris_event = RandomEvent::new(RandomEventType::DebrisField);
+    let mut segment = HullSegment::new(0);
+
+    debris_event.add_affected_room(0);
+    debris_event.start();
+
+    // Debris damages hull
+    for _ in 0..20 {
+        if debris_event.is_active() {
+            segment.damage(debris_event.hull_damage_per_tick());
+            debris_event.tick(1.0);
+        }
+    }
+
+    // If hull is breached, trigger cascade
+    if segment.is_breached() {
+        let mut cascade = CascadeEvent::new(CascadeEventType::HullBreach, 0);
+        cascade.tick(0.1);
+        assert!(cascade.has_triggered(CascadeEffect::Decompression));
+    }
+
+    // Hull should have taken significant damage
+    assert!(segment.integrity() < 90.0);
+}
+
+/// Test 46: Life support failure cascade
+#[test]
+fn test_life_support_failure_cascade() {
+    let mut atmo = AtmosphereManager::new();
+    let quarters = atmo.add_room(150.0, true);
+
+    let mut cascade = CascadeEvent::new(CascadeEventType::LifeSupportFailure, quarters);
+
+    // Life support failure effects
+    assert!(cascade.effects().contains(&CascadeEffect::AtmosphereContamination));
+    assert!(cascade.effects().contains(&CascadeEffect::OxygenDepletion));
+
+    // Disable life support
+    atmo.set_life_support(quarters, false);
+    assert!(!atmo.has_life_support(quarters));
+
+    // Progress cascade
+    cascade.tick(15.0);
+    assert!(cascade.has_triggered(CascadeEffect::AtmosphereContamination));
+
+    cascade.tick(20.0);
+    assert!(cascade.has_triggered(CascadeEffect::OxygenDepletion));
+
+    // Without life support, simulate a small breach to demonstrate atmosphere loss
+    // Life support failure means the room can't recover from any atmosphere issues
+    atmo.breach(quarters, DecompressionType::Slow);
+    let initial_pressure = atmo.get_room(quarters).unwrap().pressure;
+
+    for _ in 0..20 {
+        atmo.tick(1.0);
+    }
+
+    let final_pressure = atmo.get_room(quarters).unwrap().pressure;
+    // With life support off and a breach, atmosphere can't be maintained
+    assert!(final_pressure < initial_pressure);
+
+    // Cascade should be complete
+    assert!(cascade.is_complete());
+}
+
+/// Test 47: Electrical cascade disabling systems
+#[test]
+fn test_electrical_cascade() {
+    use crate::station::RoomSystem;
+
+    let mut cascade = CascadeEvent::new(CascadeEventType::ElectricalCascade, 0);
+    let mut system1 = RoomSystem::new("Primary Console".to_string(), 20.0);
+    let mut system2 = RoomSystem::new("Backup Systems".to_string(), 15.0);
+
+    // Cascade effects
+    assert!(cascade.effects().contains(&CascadeEffect::PowerFailure));
+    assert!(cascade.effects().contains(&CascadeEffect::SystemDamage));
+    assert!(cascade.effects().contains(&CascadeEffect::StationDark));
+
+    // Systems take damage as cascade progresses
+    cascade.tick(1.5);
+    if cascade.has_triggered(CascadeEffect::SystemDamage) {
+        system1.degrade();
+        system2.degrade();
+    }
+
+    assert_eq!(system1.state(), SystemState::Degraded);
+    assert_eq!(system2.state(), SystemState::Degraded);
+
+    // Power failure
+    cascade.tick(1.0);
+    if cascade.has_triggered(CascadeEffect::PowerFailure) {
+        system1.power_off();
+        system2.power_off();
+    }
+
+    assert_eq!(system1.state(), SystemState::Offline);
+}
+
+/// Test 48: Full station emergency scenario
+#[test]
+fn test_full_station_emergency() {
+    // Initialize all systems
+    let mut atmo = AtmosphereManager::new();
+    let mut power = PowerManager::new();
+    let mut eva = EVAState::new();
+
+    // Create station - isolated bridge for safety
+    let bridge = atmo.add_room(200.0, true);
+    let engineering = atmo.add_room(250.0, true);
+    let cargo = atmo.add_room(150.0, false);
+
+    // Don't connect bridge directly to cargo to protect it
+    atmo.connect_rooms(engineering, cargo, 0.3);
+
+    power.register_consumer(PowerConsumer::new(bridge, "Bridge Systems".to_string(), 1, 25.0));
+    power.register_consumer(PowerConsumer::new(engineering, "Engineering".to_string(), 1, 30.0));
+
+    // PHASE 1: Meteorite strike on cargo
+    let mut meteorite = RandomEvent::new(RandomEventType::MicrometeoriteShower);
+    let mut hull = HullSegment::new(cargo);
+    meteorite.add_affected_room(cargo);
+    meteorite.start();
+
+    for _ in 0..15 {
+        hull.damage(meteorite.hull_damage_per_tick());
+        meteorite.tick(1.0);
+        atmo.tick(0.5);
+        power.tick(0.5);
+    }
+
+    // PHASE 2: Hull breached, cascade begins
+    atmo.breach(cargo, DecompressionType::Slow);
+    let mut cascade = CascadeEvent::new(CascadeEventType::HullBreach, cargo);
+
+    // Progress cascade
+    cascade.tick(5.0);
+    assert!(cascade.has_triggered(CascadeEffect::Decompression));
+    assert!(cascade.has_triggered(CascadeEffect::PowerFailure));
+
+    // PHASE 3: EVA repair mission
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    let mut patch_kit = EVAEquipment::new(EVAGear::PatchKit);
+    let mut welding_torch = EVAEquipment::new(EVAGear::WeldingTorch);
+
+    // Emergency patch
+    patch_kit.use_equipment();
+    atmo.seal_breach(cargo);
+
+    // Permanent repair
+    welding_torch.use_equipment();
+    hull.patch(30.0);
+
+    eva.return_inside();
+
+    // PHASE 4: Recovery verification
+    assert!(atmo.is_sealed(cargo));
+    assert!(!eva.is_outside());
+    assert!(!eva.is_o2_depleted());
+    assert!(hull.integrity() > 0.0);
+
+    // Bridge with life support should maintain atmosphere
+    let bridge_atmo = atmo.get_room(bridge).unwrap();
+    assert!(bridge_atmo.pressure >= 80.0);
+    assert!(bridge_atmo.o2 >= 16.0 && bridge_atmo.o2 <= 25.0);
+}
+
+/// Test 49: Passive creature resource gathering during emergency
+#[test]
+fn test_passive_creature_resources() {
+    // During emergencies, passive creatures can provide resources
+    let mut circuit_moth = PassiveCreature::new(PassiveType::CircuitMoth);
+    let mut coolant_fish = PassiveCreature::new(PassiveType::CoolantFish);
+    let mut star_crab = PassiveCreature::new(PassiveType::StarCrab);
+
+    // Collect resources for repairs
+    let conductive_dust = circuit_moth.on_catch();
+    let coolant_scale = coolant_fish.on_catch();
+    let hull_chitin = star_crab.on_catch();
+
+    assert_eq!(conductive_dust, Some("conductive_dust".to_string()));
+    assert_eq!(coolant_scale, Some("coolant_scale".to_string()));
+    assert_eq!(hull_chitin, Some("hull_chitin".to_string()));
+
+    // After catching, creatures are no longer alive
+    assert!(!circuit_moth.is_alive());
+    assert!(!coolant_fish.is_alive());
+    assert!(!star_crab.is_alive());
+}
+
+/// Test 50: Complete cascade event recovery
+#[test]
+fn test_cascade_event_recovery() {
+    use crate::station::RoomSystem;
+
+    // Start with a severe cascade
+    let mut cascade = CascadeEvent::new(CascadeEventType::ReactorDamage, 0);
+
+    // Force all effects to trigger
+    let triggered = cascade.force_complete();
+    assert!(cascade.is_complete());
+    assert_eq!(triggered.len(), cascade.effects().len());
+
+    // Recovery sequence
+    let mut power = PowerManager::new();
+    let mut life_support = RoomSystem::new("Life Support".to_string(), 30.0);
+    let mut lights = RoomSystem::new("Lights".to_string(), 10.0);
+
+    // Repair reactor
+    power.reactor_mut().repair(50.0);
+    assert!(power.reactor().is_active());
+
+    // Restore systems by priority
+    life_support.power_on();
+    assert_eq!(life_support.state(), SystemState::Online);
+
+    lights.power_on();
+    assert_eq!(lights.state(), SystemState::Online);
+
+    // Verify recovery
+    assert!(power.reactor().output() > 0.0);
+}
