@@ -5,3 +5,4 @@
 pub mod collision;
 pub mod raycast;
 pub mod simulation;
+pub mod vacuum;

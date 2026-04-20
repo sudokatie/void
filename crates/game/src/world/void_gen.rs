@@ -209,7 +209,7 @@ mod tests {
         let chunk1 = gen1.generate_chunk(pos);
         let chunk2 = gen2.generate_chunk(pos);
 
-        assert_eq!(chunk1.biome, chunk2.biome);
+        assert_eq!(chunk1.biome_name, chunk2.biome_name);
         assert!((chunk1.temperature - chunk2.temperature).abs() < f32::EPSILON);
     }
 
@@ -227,6 +227,6 @@ mod tests {
         let generator = VoidGenerator::new(1);
         let chunk = generator.generate_chunk(IVec3::new(0, 5, 0));
 
-        assert_eq!(chunk.biome, "BedrockPlatform");
+        assert_eq!(chunk.biome_name, "BedrockPlatform");
     }
 }

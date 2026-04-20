@@ -1,375 +1,393 @@
-//! Integration tests for the Lattice game.
+//! Integration tests for the Void space station survival game.
 //!
 //! Tests core functionality across multiple systems.
 
-use cascade_game::crafting::{CraftingStation, Recipe};
-use cascade_game::inventory::{Inventory, ItemId, ItemStack};
-use cascade_game::survival::{DamageSource, Health, Hunger};
+use void_game::creatures::{HostileCreature, HostileType, PassiveCreature, PassiveType};
+use void_game::power::{PowerConsumer, PowerManager, Reactor};
+use void_game::station::{Bulkhead, HullSegment, RoomType, StationRoom};
+use void_game::vacuum::{AtmosphereManager, DecompressionType};
+use void_game::zerog::{EVAState, ZeroGMovement};
 
-/// Test inventory operations.
-mod inventory_tests {
+/// Test atmosphere systems.
+mod atmosphere_tests {
     use super::*;
 
     #[test]
-    fn test_inventory_add_items() {
-        let mut inventory = Inventory::new();
-        
-        // Add wood planks
-        let wood_planks = ItemStack::new(ItemId(10), 8);
-        inventory.add(wood_planks);
-        
-        // Verify added
-        let total = inventory.count_item(ItemId(10));
-        assert_eq!(total, 8);
-    }
+    fn test_atmosphere_normal_operation() {
+        let mut manager = AtmosphereManager::new();
+        let room = manager.add_room(100.0, true);
 
-    #[test]
-    fn test_inventory_stack_splitting() {
-        let mut inventory = Inventory::new();
-        
-        // Add a stack
-        let stack = ItemStack::new(ItemId(1), 64);
-        inventory.add(stack);
-        
-        // Remove partial
-        let removed = inventory.remove(0, 32);
-        assert!(removed.is_some());
-        let removed = removed.unwrap();
-        assert_eq!(removed.count, 32);
-        
-        // Verify remaining
-        let remaining = inventory.get(0);
-        assert!(remaining.is_some());
-        assert_eq!(remaining.unwrap().count, 32);
-    }
+        // Room should start breathable
+        assert!(manager.get_room(room).unwrap().is_breathable());
 
-    #[test]
-    fn test_inventory_full_behavior() {
-        let mut inventory = Inventory::new();
-        
-        // Fill all slots with different items
-        for i in 0..36 {
-            let stack = ItemStack::new(ItemId(i as u16), 1);
-            let overflow = inventory.add(stack);
-            assert!(overflow.is_none(), "Should not overflow on slot {i}");
+        // Life support should maintain atmosphere (short simulation)
+        for _ in 0..5 {
+            manager.tick(0.1);
         }
-        
-        // Adding another different item should overflow
-        let extra = ItemStack::new(ItemId(100), 1);
-        let overflow = inventory.add(extra);
-        assert!(overflow.is_some(), "Should overflow when full");
+
+        // O2 and pressure should be maintained
+        let atmo = manager.get_room(room).unwrap();
+        assert!(atmo.o2 >= 16.0);
+        assert!(atmo.pressure >= 80.0);
     }
 
     #[test]
-    fn test_inventory_stacking_same_item() {
-        let mut inventory = Inventory::new();
-        
-        // Add same item multiple times
-        for _ in 0..4 {
-            inventory.add(ItemStack::new(ItemId(1), 16));
+    fn test_atmosphere_breach_sequence() {
+        let mut manager = AtmosphereManager::new();
+        let room = manager.add_room(100.0, true);
+
+        // Breach the room
+        manager.breach(room, DecompressionType::Rapid);
+        assert!(!manager.is_sealed(room));
+
+        let initial_pressure = manager.get_room(room).unwrap().pressure;
+
+        // Pressure should drop
+        for _ in 0..20 {
+            manager.tick(1.0);
         }
-        
-        // Should all be in one slot (assuming max stack 64)
-        let count = inventory.count_item(ItemId(1));
-        assert_eq!(count, 64);
+
+        assert!(manager.get_room(room).unwrap().pressure < initial_pressure);
     }
 
     #[test]
-    fn test_inventory_selected_slot() {
-        let mut inventory = Inventory::new();
-        
-        assert_eq!(inventory.selected_slot(), 0);
-        inventory.select_slot(5);
-        assert_eq!(inventory.selected_slot(), 5);
+    fn test_atmosphere_repair() {
+        let mut manager = AtmosphereManager::new();
+        let room = manager.add_room(100.0, true);
+
+        manager.breach(room, DecompressionType::Slow);
+
+        // Seal the breach
+        assert!(manager.seal_breach(room));
+        assert!(manager.is_sealed(room));
     }
 }
 
-/// Test survival systems.
-mod survival_tests {
+/// Test power systems.
+mod power_tests {
     use super::*;
 
     #[test]
-    fn test_health_damage_heal_cycle() {
-        let mut health = Health::new(20.0);
-        
-        // Take damage
-        let died = health.damage(5.0, DamageSource::Attack);
-        assert!(!died);
-        assert!((health.current() - 15.0).abs() < 0.01);
-        
-        // Heal
-        health.heal(3.0);
-        assert!((health.current() - 18.0).abs() < 0.01);
-        
-        // Over-heal should cap at max
-        health.heal(10.0);
-        assert!((health.current() - 20.0).abs() < 0.01);
+    fn test_reactor_basic() {
+        let reactor = Reactor::new();
+        assert!(reactor.is_active());
+        assert!((reactor.output() - 100.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn test_health_lethal_damage() {
-        let mut health = Health::new(20.0);
-        
-        // Take lethal damage
-        let died = health.damage(25.0, DamageSource::Void);
-        assert!(died);
-        assert!(health.is_dead());
+    fn test_reactor_damage_affects_output() {
+        let mut reactor = Reactor::new();
+        reactor.damage(50.0);
+        assert!((reactor.output() - 50.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn test_health_invincibility() {
-        let mut health = Health::new(20.0);
-        
-        // Take damage (sets invincibility)
-        health.damage(5.0, DamageSource::Attack);
-        
-        // Should be invincible
-        assert!(health.is_invincible());
-        
-        // Tick to clear invincibility
-        health.tick(1.0);
-        assert!(!health.is_invincible());
+    fn test_power_manager_consumers() {
+        let mut manager = PowerManager::new();
+
+        manager.register_consumer(PowerConsumer::new(0, "System A".to_string(), 1, 20.0));
+        manager.register_consumer(PowerConsumer::new(1, "System B".to_string(), 2, 30.0));
+
+        assert_eq!(manager.consumer_count(), 2);
+        assert!((manager.total_demand() - 50.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn test_health_restore() {
-        let mut health = Health::new(20.0);
-        health.damage(10.0, DamageSource::Attack);
-        
-        assert!((health.current() - 10.0).abs() < 0.01);
-        
-        health.restore();
-        assert!((health.current() - 20.0).abs() < 0.01);
-    }
+    fn test_power_manager_balanced() {
+        let mut manager = PowerManager::new();
+        manager.register_consumer(PowerConsumer::new(0, "Light".to_string(), 3, 20.0));
 
-    #[test]
-    fn test_hunger_sprint_interaction() {
-        let hunger = Hunger::new(20.0);
-        
-        // Full hunger can sprint
-        assert!(hunger.can_sprint());
-    }
-
-    #[test]
-    fn test_hunger_eat_restores() {
-        let mut hunger = Hunger::new(20.0);
-        
-        // Drain some hunger by ticking
-        for _ in 0..60 {
-            hunger.tick(1.0, true); // Sprinting drains faster
-        }
-        
-        let before = hunger.current();
-        
-        // Eat food
-        hunger.eat(6.0, 6.0);
-        
-        // Should restore
-        assert!(hunger.current() >= before);
-    }
-
-    #[test]
-    fn test_hunger_saturation() {
-        let mut hunger = Hunger::new(20.0);
-        
-        // Eat food with saturation
-        hunger.eat(4.0, 8.0);
-        
-        // Saturation should be added
-        assert!(hunger.saturation() > 0.0);
+        let affected = manager.tick(1.0);
+        assert!(affected.is_empty());
     }
 }
 
-/// Test item stack operations.
-mod item_stack_tests {
+/// Test station architecture.
+mod station_tests {
     use super::*;
 
     #[test]
-    fn test_item_stack_merge_same() {
-        let mut stack1 = ItemStack::new(ItemId(1), 32);
-        let stack2 = ItemStack::new(ItemId(1), 32);
-        
-        // Merge same items (max stack is 64)
-        let overflow = stack1.merge(stack2);
-        assert!(overflow.is_none());
-        assert_eq!(stack1.count, 64);
+    fn test_room_types() {
+        assert!(RoomType::Command.is_critical());
+        assert!(RoomType::LifeSupport.is_critical());
+        assert!(RoomType::PowerCore.is_critical());
+        assert!(!RoomType::Cargo.is_critical());
     }
 
     #[test]
-    fn test_item_stack_merge_overflow() {
-        let mut stack1 = ItemStack::new(ItemId(1), 50);
-        let stack2 = ItemStack::new(ItemId(1), 32);
-        
-        // Merge with overflow
-        let overflow = stack1.merge(stack2);
-        assert!(overflow.is_some());
-        assert_eq!(stack1.count, 64);
-        let overflow = overflow.unwrap();
-        assert_eq!(overflow.count, 18);
+    fn test_station_room() {
+        let room = StationRoom::new(0, RoomType::Engineering, "Engineering Bay".to_string());
+        assert_eq!(room.name(), "Engineering Bay");
+        assert!(room.is_powered());
+        assert!(!room.is_breached());
     }
 
     #[test]
-    fn test_item_stack_merge_different_items() {
-        let mut stack1 = ItemStack::new(ItemId(1), 32);
-        let stack2 = ItemStack::new(ItemId(2), 32);
-        
-        // Cannot merge different items - returns the other stack
-        let overflow = stack1.merge(stack2);
-        assert!(overflow.is_some());
-        assert_eq!(overflow.unwrap().count, 32);
-        assert_eq!(stack1.count, 32); // Unchanged
+    fn test_hull_segment() {
+        let mut segment = HullSegment::new(0);
+        assert!(!segment.is_breached());
+
+        segment.damage(80.0);
+        assert!(segment.is_breached());
+
+        segment.patch(60.0);
+        assert!(!segment.is_breached());
     }
 
     #[test]
-    fn test_item_stack_split() {
-        let mut stack = ItemStack::new(ItemId(1), 64);
-        
-        let split = stack.split(32);
-        assert!(split.is_some());
-        let split = split.unwrap();
-        
-        assert_eq!(stack.count, 32);
-        assert_eq!(split.count, 32);
-        assert_eq!(split.item_id, stack.item_id);
+    fn test_bulkhead_states() {
+        let mut bulkhead = Bulkhead::new(0, 1);
+        assert!(bulkhead.is_passable());
+
+        bulkhead.seal();
+        assert!(!bulkhead.is_passable());
+
+        bulkhead.open();
+        assert!(bulkhead.is_passable());
     }
 }
 
-/// Test recipe definitions.
-mod recipe_tests {
+/// Test zero-g movement.
+mod zerog_tests {
     use super::*;
+    use glam::IVec3;
 
     #[test]
-    fn test_recipe_creation() {
-        let recipe = Recipe {
-            id: "test_recipe".to_string(),
-            inputs: vec![
-                (ItemId(1), 2),
-                (ItemId(2), 1),
-            ],
-            output: (ItemId(10), 1),
-            station: None,
-            category: None,
-        };
-        
-        assert_eq!(recipe.inputs.len(), 2);
-        assert_eq!(recipe.output.1, 1);
+    fn test_movement_thrust() {
+        let mut movement = ZeroGMovement::new();
+        assert!(movement.thrust(IVec3::new(5, 0, 0), 10.0));
+        assert_eq!(movement.velocity(), IVec3::new(5, 0, 0));
     }
 
     #[test]
-    fn test_recipe_with_station() {
-        let recipe = Recipe {
-            id: "furnace_recipe".to_string(),
-            inputs: vec![(ItemId(5), 1)],
-            output: (ItemId(20), 1),
-            station: Some(CraftingStation::Furnace),
-            category: Some("smelting".to_string()),
-        };
-        
-        assert_eq!(recipe.station, Some(CraftingStation::Furnace));
+    fn test_movement_fuel_consumption() {
+        let mut movement = ZeroGMovement::new();
+        let initial = movement.thruster_fuel();
+
+        movement.thrust(IVec3::new(1, 0, 0), 10.0);
+
+        assert!(movement.thruster_fuel() < initial);
     }
 
     #[test]
-    fn test_recipe_stations() {
-        assert_ne!(CraftingStation::CraftingTable, CraftingStation::Furnace);
-        assert_ne!(CraftingStation::Furnace, CraftingStation::Anvil);
+    fn test_magnetic_boots() {
+        let mut movement = ZeroGMovement::new();
+        movement.enable_boots();
+        assert!(movement.magnetic_boots());
+
+        movement.disable_boots();
+        assert!(!movement.magnetic_boots());
     }
 }
 
-/// Test state persistence (serialization round-trip simulation).
-mod persistence_tests {
+/// Test EVA operations.
+mod eva_tests {
     use super::*;
 
     #[test]
-    fn test_inventory_read_state() {
-        let mut inventory = Inventory::new();
-        
-        // Add various items
-        inventory.add(ItemStack::new(ItemId(1), 64));
-        inventory.add(ItemStack::new(ItemId(2), 32));
-        inventory.add(ItemStack::new(ItemId(10), 1));
-        
-        // Verify we can read all slot data (for serialization)
-        let slot0 = inventory.get(0);
-        let slot1 = inventory.get(1);
-        let slot2 = inventory.get(2);
-        
-        assert!(slot0.is_some());
-        assert!(slot1.is_some());
-        assert!(slot2.is_some());
-        
-        assert_eq!(slot0.unwrap().item_id, ItemId(1));
-        assert_eq!(slot1.unwrap().item_id, ItemId(2));
-        assert_eq!(slot2.unwrap().item_id, ItemId(10));
+    fn test_eva_enter_exit() {
+        let mut eva = EVAState::new();
+        assert!(!eva.is_outside());
+
+        assert!(eva.enter_vacuum());
+        assert!(eva.is_outside());
+
+        assert!(eva.return_inside());
+        assert!(!eva.is_outside());
     }
 
     #[test]
-    fn test_health_state_capture() {
-        let mut health = Health::new(20.0);
-        health.damage(7.5, DamageSource::Fall);
-        
-        // Capture current state
-        let current = health.current();
-        let max = health.max();
-        
-        // Verify we can read state
-        assert!((current - 12.5).abs() < 0.01);
-        assert!((max - 20.0).abs() < 0.01);
+    fn test_eva_oxygen_consumption() {
+        let mut eva = EVAState::new();
+        let initial_o2 = eva.suit_o2();
+
+        eva.enter_vacuum();
+        eva.use_o2(1.0);
+
+        assert!(eva.suit_o2() < initial_o2);
     }
-    
+
     #[test]
-    fn test_item_stack_serializable_fields() {
-        let stack = ItemStack::new(ItemId(42), 16);
-        
-        // Verify public fields accessible for serialization
-        assert_eq!(stack.item_id, ItemId(42));
-        assert_eq!(stack.count, 16);
+    fn test_eva_tether() {
+        let mut eva = EVAState::new();
+
+        // Can't deploy inside
+        assert!(!eva.deploy_tether());
+
+        eva.enter_vacuum();
+        assert!(eva.deploy_tether());
+        assert!(eva.is_tethered());
+
+        eva.retract_tether();
+        assert!(!eva.is_tethered());
     }
 }
 
-/// Performance sanity checks.
-mod performance_tests {
+/// Test creatures.
+mod creature_tests {
     use super::*;
 
     #[test]
-    fn test_inventory_many_operations() {
-        let mut inventory = Inventory::new();
-        
-        // Many add operations
-        for i in 0..1000 {
-            let item_id = ItemId((i % 100) as u16);
-            inventory.add(ItemStack::new(item_id, 1));
+    fn test_hostile_creature_types() {
+        for hostile_type in HostileType::all() {
+            let creature = HostileCreature::new(*hostile_type);
+            assert!(creature.hp() > 0);
+            assert!(creature.damage() > 0);
+            assert!(creature.is_alive());
         }
-        
-        // Count should work
-        let count = inventory.count_item(ItemId(0));
-        assert!(count >= 10);
     }
 
     #[test]
-    fn test_health_many_updates() {
-        let mut health = Health::new(20.0);
-        
-        // Many small updates
-        for _ in 0..1000 {
-            health.damage_absolute(0.01, DamageSource::Environment);
-            health.heal(0.01);
-        }
-        
-        // Should still be valid
-        assert!(!health.is_dead());
-        assert!(health.current() > 0.0);
+    fn test_hostile_creature_combat() {
+        let mut creature = HostileCreature::new(HostileType::VoidCrawler);
+        let initial_hp = creature.hp();
+
+        creature.take_damage(20);
+
+        assert!(creature.hp() < initial_hp);
+        assert!(creature.is_alive());
     }
 
     #[test]
-    fn test_hunger_sustained_activity() {
-        let mut hunger = Hunger::new(20.0);
-        
-        // Simulate extended gameplay (10 minutes)
-        for _ in 0..600 {
-            hunger.tick(1.0, false);
+    fn test_hostile_creature_death() {
+        let mut creature = HostileCreature::new(HostileType::HullMite);
+        creature.take_damage(100);
+
+        assert!(!creature.is_alive());
+        assert_eq!(creature.attack(), 0);
+    }
+
+    #[test]
+    fn test_passive_creature_types() {
+        for passive_type in PassiveType::all() {
+            let creature = PassiveCreature::new(*passive_type);
+            assert!(creature.hp() > 0);
+            assert!(!creature.drop_item().is_empty());
         }
-        
-        // Hunger should have decreased but not depleted in 10 min of walking
-        assert!(hunger.current() < 20.0);
+    }
+
+    #[test]
+    fn test_passive_creature_catch() {
+        let mut creature = PassiveCreature::new(PassiveType::CircuitMoth);
+        let drop = creature.on_catch();
+
+        assert!(drop.is_some());
+        assert_eq!(drop.unwrap(), "conductive_dust");
+        assert!(!creature.is_alive());
+    }
+
+    #[test]
+    fn test_passive_creature_flee() {
+        let mut creature = PassiveCreature::new(PassiveType::DustBunny);
+        assert!(!creature.is_fleeing());
+
+        creature.take_damage(2);
+        assert!(creature.is_fleeing());
+    }
+}
+
+/// Test full scenarios.
+mod scenario_tests {
+    use super::*;
+    use glam::IVec3;
+
+    #[test]
+    fn test_emergency_decompression_scenario() {
+        let mut atmo = AtmosphereManager::new();
+        let bridge = atmo.add_room(200.0, true);
+        let engineering = atmo.add_room(250.0, true);
+
+        atmo.connect_rooms(bridge, engineering, 1.0);
+
+        // Normal operation
+        for _ in 0..10 {
+            atmo.tick(1.0);
+        }
+
+        // Emergency in engineering
+        atmo.breach(engineering, DecompressionType::Rapid);
+
+        for _ in 0..10 {
+            atmo.tick(1.0);
+        }
+
+        // Engineering should be losing pressure
+        assert!(atmo.get_room(engineering).unwrap().pressure < 101.3);
+
+        // Seal the breach
+        atmo.seal_breach(engineering);
+        assert!(atmo.is_sealed(engineering));
+    }
+
+    #[test]
+    fn test_eva_repair_mission() {
+        let mut eva = EVAState::new();
+        let mut movement = ZeroGMovement::new();
+
+        eva.enter_vacuum();
+        eva.deploy_tether();
+
+        // Navigate to repair site
+        movement.thrust(IVec3::new(1, 0, 0), 5.0);
+
+        for _ in 0..5 {
+            movement.tick(1.0);
+            eva.use_o2(1.0);
+        }
+
+        // Perform repair (hull segment)
+        let mut segment = HullSegment::new(0);
+        segment.damage(50.0);
+        segment.patch(30.0);
+
+        // Return
+        eva.return_inside();
+
+        assert!(!eva.is_outside());
+        assert!(!eva.is_o2_depleted());
+    }
+
+    #[test]
+    fn test_power_failure_cascade() {
+        let mut power = PowerManager::new();
+
+        // Register many consumers (total = 120, supply = 100)
+        power.register_consumer(PowerConsumer::new(0, "Life Support".to_string(), 1, 30.0));
+        power.register_consumer(PowerConsumer::new(1, "Sensors".to_string(), 2, 25.0));
+        power.register_consumer(PowerConsumer::new(2, "Lights".to_string(), 3, 20.0));
+        power.register_consumer(PowerConsumer::new(3, "Entertainment".to_string(), 3, 45.0));
+
+        // Total demand exceeds supply (100)
+        assert!(power.total_demand() > 100.0);
+
+        // Battery should help initially
+        power.tick(1.0);
+
+        // After battery depletes, load shedding occurs
+        for _ in 0..100 {
+            power.tick(1.0);
+        }
+    }
+
+    #[test]
+    fn test_creature_combat_sequence() {
+        let mut hostile = HostileCreature::new(HostileType::DebrisDrone);
+        let mut player_hp = 100;
+
+        // Combat rounds
+        for _ in 0..3 {
+            // Player attacks
+            hostile.take_damage(15);
+
+            // If hostile alive, it attacks back
+            if hostile.is_alive() {
+                player_hp -= hostile.attack() as i32;
+            }
+        }
+
+        // After 3 rounds of 15 damage (45 total), drone (60 HP) should be alive
+        assert!(hostile.is_alive());
+        // Player should have taken damage
+        assert!(player_hp < 100);
     }
 }

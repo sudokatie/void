@@ -1,27 +1,9 @@
-//! Creature systems for time-loop survival.
+//! Creature systems for space station survival.
 //!
-//! Provides hostile and passive creatures that exist within the time loop.
+//! Provides hostile and passive creatures that inhabit the void.
 
 mod hostile;
 mod passive;
 
-pub use hostile::{
-    AbilityResult, HostileCreature, HostileSpawnCondition, HostileType, LoopPhaseSpawn,
-    SpecialAbilityInfo,
-};
-pub use passive::{LoopParity, PassiveCreature, PassiveLoopPhase, PassiveSpawnCondition, PassiveType};
-
-/// Time of day for creature spawning (re-exported for compatibility).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum TimeOfDay {
-    /// Daytime.
-    Day,
-    /// Nighttime.
-    Night,
-    /// Any time.
-    Any,
-}
-
-/// Mood requirement placeholder for compatibility.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MoodRequirement;
+pub use hostile::{AbilityResult, HostileCreature, HostileType, SpecialAbilityInfo};
+pub use passive::{PassiveCreature, PassiveType};

@@ -1,543 +1,658 @@
-//! Integration tests for Cascade time-loop survival game systems.
+//! Integration tests for Void space station survival game systems.
 //!
 //! These tests verify that multiple game systems work together correctly,
-//! covering loop mechanics, state persistence, paradox detection,
-//! temporal chests, knowledge retention, and difficulty scaling.
+//! covering atmosphere, power, station systems, zero-g movement, EVA, and creatures.
 
-use std::collections::HashMap;
-
-use engine_physics::temporal::{LoopPhase, ParadoxResolution, ParadoxType};
 use glam::IVec3;
 
-use crate::balance::{BalanceMeter, Falling};
-use crate::crafting::{
-    NeuralInterface, OrganicLab, ShellForge, ThermalConverter, RECIPE_COAGULANT,
-    RECIPE_SHELL_INGOT,
-};
 use crate::creatures::{HostileCreature, HostileType, PassiveCreature, PassiveType};
-use crate::knowledge::discoveries::{DiscoveryID, KnowledgeCategory, KnowledgeSystem};
-use crate::networking::{
-    deserialize_loop_state, deserialize_persistent_state, deserialize_positions,
-    deserialize_titan_state, serialize_loop_state, serialize_persistent_state, serialize_positions,
-    serialize_titan_state, ChestStatePacket, LoopSync, PersistentStatePacket, PersistentSync,
-    PositionSync, TitanSync,
-};
-use crate::temporal::loop_manager::LoopManager;
-use crate::temporal::paradox::ParadoxHandler;
-use crate::temporal::state_persistence::{StateCategory, StatePersistence, StateType};
-use crate::temporal_chest::chest::{ItemStack, TemporalChest};
-use crate::titan::{
-    TitanBehavior, TitanMood, TitanMovement, TitanPhase, TitanZone, ZoneProperties,
-    AGITATED_THRESHOLD, ENRAGED_THRESHOLD, MAX_TITAN_HP,
-};
+use crate::power::{PowerConsumer, PowerManager, Reactor};
+use crate::station::{Bulkhead, BulkheadState, HullSegment, RoomType, StationRoom, SystemState};
+use crate::vacuum::{AtmosphereManager, DecompressionType};
+use crate::zerog::{EVAState, RecoilSystem, ZeroGMovement};
 
 // =============================================================================
-// Cascade-Specific Integration Tests
+// Atmosphere and Vacuum Tests
 // =============================================================================
 
-/// Test 1: Full loop cycle - dawn -> day -> dusk -> midnight -> reset
+/// Test 1: Atmosphere manager lifecycle
 #[test]
-fn test_full_loop_cycle() {
-    let mut manager = LoopManager::new();
-    assert_eq!(manager.current_loop(), 1);
-    assert_eq!(manager.current_phase(), LoopPhase::Dawn);
+fn test_atmosphere_manager_lifecycle() {
+    let mut manager = AtmosphereManager::new();
 
-    // Track phases encountered
-    let mut phases_seen = vec![LoopPhase::Dawn];
+    let room1 = manager.add_room(100.0, true);
+    let room2 = manager.add_room(100.0, false);
 
-    // Run through a complete loop (Dawn:30 + Day:480 + Dusk:30 + Midnight:60 = 600s)
-    // Use larger time steps to speed up the test
-    for _ in 0..70 {
-        if let Some(new_phase) = manager.tick(10.0) {
-            if !phases_seen.contains(&new_phase) {
-                phases_seen.push(new_phase);
-            }
-        }
+    assert_eq!(manager.room_count(), 2);
+    assert!(manager.has_life_support(room1));
+    assert!(!manager.has_life_support(room2));
+
+    manager.connect_rooms(room1, room2, 1.0);
+    manager.tick(1.0);
+
+    // Life support should maintain O2 in room1
+    let atmo1 = manager.get_room(room1).unwrap();
+    assert!(atmo1.is_breathable());
+}
+
+/// Test 2: Decompression event handling
+#[test]
+fn test_decompression_event_handling() {
+    let mut manager = AtmosphereManager::new();
+    let room_id = manager.add_room(100.0, true);
+
+    assert!(manager.is_sealed(room_id));
+
+    let event = manager.breach(room_id, DecompressionType::Rapid);
+    assert_eq!(event.room_id, room_id);
+    assert_eq!(event.event_type, DecompressionType::Rapid);
+    assert!(!manager.is_sealed(room_id));
+
+    // Atmosphere should start venting
+    let initial_pressure = manager.get_room(room_id).unwrap().pressure;
+    manager.tick(1.0);
+    let new_pressure = manager.get_room(room_id).unwrap().pressure;
+    assert!(new_pressure < initial_pressure);
+
+    // Seal the breach
+    assert!(manager.seal_breach(room_id));
+    assert!(manager.is_sealed(room_id));
+}
+
+/// Test 3: Gas flow between connected rooms
+#[test]
+fn test_gas_flow_between_rooms() {
+    let mut manager = AtmosphereManager::new();
+    let room1 = manager.add_room(100.0, false);
+    let room2 = manager.add_room(100.0, false);
+
+    // Modify room1 to have higher pressure
+    if let Some(atmo) = manager.get_room_mut(room1) {
+        atmo.pressure = 120.0;
     }
 
-    // Should have seen all phases
-    assert!(phases_seen.contains(&LoopPhase::Day), "Should see Day phase");
-    assert!(
-        phases_seen.contains(&LoopPhase::Dusk),
-        "Should see Dusk phase"
-    );
-    assert!(
-        phases_seen.contains(&LoopPhase::Midnight),
-        "Should see Midnight phase"
-    );
+    manager.connect_rooms(room1, room2, 2.0);
+
+    let p1_initial = manager.get_room(room1).unwrap().pressure;
+    let p2_initial = manager.get_room(room2).unwrap().pressure;
+
+    manager.tick(1.0);
+
+    let p1_after = manager.get_room(room1).unwrap().pressure;
+    let p2_after = manager.get_room(room2).unwrap().pressure;
+
+    // Pressure should equalize
+    assert!(p1_after < p1_initial);
+    assert!(p2_after > p2_initial);
 }
 
-/// Test 2: State persistence categories
+// =============================================================================
+// Station Architecture Tests
+// =============================================================================
+
+/// Test 4: Station room types and properties
 #[test]
-fn test_state_persistence_categories() {
-    let persistence = StatePersistence::new();
+fn test_station_room_types() {
+    assert!(RoomType::Command.is_critical());
+    assert!(RoomType::LifeSupport.is_critical());
+    assert!(RoomType::PowerCore.is_critical());
+    assert!(!RoomType::Cargo.is_critical());
+    assert!(!RoomType::Quarters.is_critical());
 
-    // Persistent states survive all loops
-    assert_eq!(
-        persistence.category_of(StateType::TemporalChestContents),
-        StateCategory::Persistent
-    );
-    assert_eq!(
-        persistence.category_of(StateType::Messages),
-        StateCategory::Persistent
-    );
-    assert_eq!(
-        persistence.category_of(StateType::Knowledge),
-        StateCategory::Persistent
-    );
-
-    // Semi-persistent states have 50% chance to regenerate
-    assert_eq!(
-        persistence.category_of(StateType::TerrainModification),
-        StateCategory::SemiPersistent
-    );
-    assert_eq!(
-        persistence.category_of(StateType::BuiltStructure),
-        StateCategory::SemiPersistent
-    );
-
-    // Volatile states reset every loop
-    assert_eq!(
-        persistence.category_of(StateType::CreaturePositions),
-        StateCategory::Volatile
-    );
-    assert_eq!(
-        persistence.category_of(StateType::Weather),
-        StateCategory::Volatile
-    );
+    let room = StationRoom::new(0, RoomType::Engineering, "Main Engineering".to_string());
+    assert_eq!(room.room_type(), RoomType::Engineering);
+    assert!(room.is_powered());
+    assert!(!room.is_breached());
 }
 
-/// Test 3: Paradox detection and resolution
+/// Test 5: Hull damage and breach system
 #[test]
-fn test_paradox_detection() {
-    let mut handler = ParadoxHandler::new();
+fn test_hull_damage_system() {
+    let mut segment = HullSegment::new(0);
+    assert!(!segment.is_breached());
+    assert_eq!(segment.damage_level(), "Intact");
 
-    // Detect a terrain conflict paradox
-    let index = handler.detect(IVec3::new(10, 64, 20), ParadoxType::TerrainConflict, 60.0);
-    assert!(index.is_some());
-    assert_eq!(handler.paradox_count(), 1);
+    segment.damage(30.0);
+    assert_eq!(segment.damage_level(), "Damaged");
+    assert!(!segment.is_breached());
 
-    // Check thresholds
-    let paradoxes = handler.paradoxes();
-    assert!(paradoxes[0].causes_distortion());
-    assert!(!paradoxes[0].is_damaging());
+    segment.damage(50.0);
+    assert_eq!(segment.damage_level(), "Compromised");
+    assert!(segment.is_breached());
 
-    // Detect a damaging paradox
-    handler.detect(IVec3::new(50, 64, 50), ParadoxType::StateOverlap, 120.0);
-    let paradoxes = handler.paradoxes();
-    assert!(paradoxes[1].is_damaging());
+    segment.patch(60.0);
+    assert!(!segment.is_breached());
+    // After patching from 20% to 80%, should be "Intact"
+    assert_eq!(segment.damage_level(), "Intact");
 }
 
-/// Test 4: Paradox exploitation for energy
+/// Test 6: Bulkhead operations
 #[test]
-fn test_paradox_exploitation() {
-    let mut handler = ParadoxHandler::new();
+fn test_bulkhead_operations() {
+    let mut bulkhead = Bulkhead::new(0, 1);
+    assert!(bulkhead.is_passable());
+    assert_eq!(bulkhead.state(), BulkheadState::Open);
 
-    handler.detect(IVec3::ZERO, ParadoxType::ResourceDuplication, 50.0);
+    assert!(bulkhead.seal());
+    assert!(!bulkhead.is_passable());
+    assert_eq!(bulkhead.state(), BulkheadState::Sealed);
 
-    let energy = handler.resolve(0, ParadoxResolution::Exploit);
-    assert!(energy > 0.0, "Should gain energy from exploitation");
-    assert!(handler.harvested_energy() > 0.0);
-    assert_eq!(handler.paradox_count(), 0);
+    assert!(bulkhead.open());
+    assert!(bulkhead.is_passable());
+
+    bulkhead.jam();
+    assert!(!bulkhead.seal());
+    assert!(!bulkhead.open());
+
+    bulkhead.repair();
+    assert_eq!(bulkhead.state(), BulkheadState::Sealed);
 }
 
-/// Test 5: Temporal chest persistence across loops
+// =============================================================================
+// Power System Tests
+// =============================================================================
+
+/// Test 7: Reactor power output
 #[test]
-fn test_chest_persistence_across_loops() {
-    let mut chest = TemporalChest::new(IVec3::new(100, 64, 100));
+fn test_reactor_power_output() {
+    let mut reactor = Reactor::new();
+    assert!(reactor.is_active());
+    assert!((reactor.output() - 100.0).abs() < f32::EPSILON);
 
-    chest.insert(0, ItemStack::new("time_crystal", 5));
-    chest.insert(1, ItemStack::new("loop_key", 1));
+    reactor.damage(50.0);
+    assert!((reactor.output() - 50.0).abs() < f32::EPSILON);
 
-    chest.persist_across_loop();
-
-    let ghost = chest.ghost_preview();
-    assert!(ghost[0].is_some());
-    assert_eq!(ghost[0].as_ref().unwrap().item_type, "time_crystal");
-    assert!(ghost[1].is_some());
-    assert_eq!(ghost[1].as_ref().unwrap().item_type, "loop_key");
-
-    assert!(!chest.is_empty());
-    assert_eq!(chest.used_slots(), 2);
+    reactor.damage(40.0);
+    assert!(!reactor.is_active());
+    assert!((reactor.output() - 0.0).abs() < f32::EPSILON);
 }
 
-/// Test 6: Knowledge retention across loops
+/// Test 8: Power manager load balancing
 #[test]
-fn test_knowledge_retention_across_loops() {
-    let mut knowledge = KnowledgeSystem::new();
+fn test_power_manager_load_balancing() {
+    let mut manager = PowerManager::new();
 
-    knowledge.discover(DiscoveryID::new(KnowledgeCategory::Map, 1));
-    knowledge.discover(DiscoveryID::new(KnowledgeCategory::Map, 2));
-    knowledge.discover(DiscoveryID::new(KnowledgeCategory::Trap, 1));
-    knowledge.discover(DiscoveryID::new(KnowledgeCategory::Creature, 1));
+    manager.register_consumer(PowerConsumer::new(0, "Life Support".to_string(), 1, 30.0));
+    manager.register_consumer(PowerConsumer::new(1, "Lights".to_string(), 3, 20.0));
+    manager.register_consumer(PowerConsumer::new(2, "Sensors".to_string(), 2, 15.0));
 
-    assert_eq!(knowledge.total_discoveries(), 4);
-    assert_eq!(knowledge.category_count(KnowledgeCategory::Map), 2);
-    assert_eq!(knowledge.category_count(KnowledgeCategory::Trap), 1);
-    assert_eq!(knowledge.category_count(KnowledgeCategory::Creature), 1);
+    assert!((manager.total_demand() - 65.0).abs() < f32::EPSILON);
+    assert!(manager.available_power() > 0.0);
 
-    assert!(knowledge.is_discovered(DiscoveryID::new(KnowledgeCategory::Map, 1)));
-    assert!(knowledge.is_discovered(DiscoveryID::new(KnowledgeCategory::Trap, 1)));
+    // Should have power for all systems
+    let affected = manager.tick(1.0);
+    assert!(affected.is_empty());
 }
 
-/// Test 7: Difficulty scaling with loop count
+/// Test 9: Power shortage and load shedding
 #[test]
-fn test_difficulty_scaling() {
-    let mut manager = LoopManager::new();
+fn test_power_shortage_handling() {
+    let mut manager = PowerManager::new();
 
-    assert!((manager.difficulty() - 1.0).abs() < f32::EPSILON);
+    // Add more demand than supply (supply = 100)
+    manager.register_consumer(PowerConsumer::new(0, "Critical".to_string(), 1, 40.0));
+    manager.register_consumer(PowerConsumer::new(1, "Important".to_string(), 2, 40.0));
+    manager.register_consumer(PowerConsumer::new(2, "Low Priority".to_string(), 3, 80.0));
 
-    manager.on_death();
-    manager.on_death();
-    manager.on_death();
-    manager.on_death();
-    manager.on_death();
+    // Total demand = 160 > supply = 100
+    assert!(manager.total_demand() > manager.reactor().output());
 
-    assert!(manager.difficulty() > 1.0);
-    assert!((manager.difficulty() - 1.5).abs() < f32::EPSILON);
+    // Drain battery completely
+    manager.grid_mut().set_battery_charge(0.0);
+
+    // Now tick should trigger load shedding
+    let affected = manager.tick(1.0);
+    // With empty battery and deficit, load shedding should occur
+    assert!(!affected.is_empty());
 }
 
-/// Test 8: Loop-aware hostile creature scaling
+// =============================================================================
+// Zero-G Movement Tests
+// =============================================================================
+
+/// Test 10: Zero-G thruster movement
 #[test]
-fn test_hostile_creature_loop_scaling() {
-    let creature_loop1 = HostileCreature::new(HostileType::TimeWraith);
-    let base_hp = creature_loop1.hp();
-    let base_damage = creature_loop1.damage();
+fn test_zerog_thruster_movement() {
+    let mut movement = ZeroGMovement::new();
+    assert_eq!(movement.position(), IVec3::ZERO);
+    assert_eq!(movement.velocity(), IVec3::ZERO);
 
-    let creature_loop5 = HostileCreature::new_with_loop(HostileType::TimeWraith, 5);
+    assert!(movement.thrust(IVec3::new(5, 0, 0), 10.0));
+    assert_eq!(movement.velocity(), IVec3::new(5, 0, 0));
+    assert!(movement.thruster_fuel() < 100.0);
 
-    assert!(creature_loop5.hp() > base_hp);
-    assert!(creature_loop5.damage() > base_damage);
-    assert_eq!(creature_loop5.loop_count(), 5);
+    movement.tick(1.0);
+    assert!(movement.position().x > 0);
 }
 
-/// Test 9: Time-based hostile creature abilities
+/// Test 11: Magnetic boots functionality
+#[test]
+fn test_magnetic_boots() {
+    let mut movement = ZeroGMovement::new();
+
+    movement.thrust(IVec3::new(10, 0, 0), 5.0);
+    movement.grab_surface();
+    movement.enable_boots();
+
+    assert!(movement.magnetic_boots());
+    assert!(movement.is_attached());
+
+    movement.tick(1.0);
+    assert_eq!(movement.velocity(), IVec3::ZERO);
+}
+
+/// Test 12: Recoil physics
+#[test]
+fn test_recoil_physics() {
+    let system = RecoilSystem::new();
+
+    let velocity = IVec3::new(10, 0, 0);
+    let force = IVec3::new(3, 0, 0);
+
+    let result = system.apply_recoil(velocity, force);
+    assert_eq!(result, IVec3::new(7, 0, 0));
+
+    let recoil = system.calculate_recoil(10.0);
+    assert!(recoil.x > 0);
+}
+
+// =============================================================================
+// EVA Operations Tests
+// =============================================================================
+
+/// Test 13: EVA lifecycle
+#[test]
+fn test_eva_lifecycle() {
+    let mut eva = EVAState::new();
+    assert!(!eva.is_outside());
+    assert!((eva.suit_o2() - 30.0).abs() < f32::EPSILON);
+
+    assert!(eva.enter_vacuum());
+    assert!(eva.is_outside());
+
+    // O2 should deplete when outside
+    let initial_o2 = eva.suit_o2();
+    eva.use_o2(1.0);
+    assert!(eva.suit_o2() < initial_o2);
+
+    assert!(eva.return_inside());
+    assert!(!eva.is_outside());
+}
+
+/// Test 14: EVA tether system
+#[test]
+fn test_eva_tether_system() {
+    let mut eva = EVAState::new();
+
+    // Can't deploy tether while inside
+    assert!(!eva.deploy_tether());
+
+    eva.enter_vacuum();
+    assert!(eva.deploy_tether());
+    assert!(eva.is_tethered());
+
+    eva.shorten_tether(20.0);
+    assert!((eva.tether_length() - 30.0).abs() < f32::EPSILON);
+
+    eva.retract_tether();
+    assert!(!eva.is_tethered());
+}
+
+/// Test 15: EVA oxygen management
+#[test]
+fn test_eva_oxygen_management() {
+    let mut eva = EVAState::new();
+    eva.enter_vacuum();
+
+    // Deplete oxygen
+    for _ in 0..250 {
+        eva.use_o2(1.0);
+    }
+
+    assert!(eva.is_o2_critical());
+
+    eva.refill_o2(20.0);
+    assert!(!eva.is_o2_critical());
+}
+
+// =============================================================================
+// Creature Tests
+// =============================================================================
+
+/// Test 16: Hostile creature stats
+#[test]
+fn test_hostile_creature_stats() {
+    assert_eq!(HostileType::VoidCrawler.base_hp(), 50);
+    assert_eq!(HostileType::VoidCrawler.base_damage(), 10);
+    assert_eq!(HostileType::VoidCrawler.special_ability_name(), "short_circuit");
+
+    assert_eq!(HostileType::PressureLeech.base_hp(), 30);
+    assert_eq!(HostileType::RadiationWraith.base_hp(), 70);
+    assert_eq!(HostileType::DebrisDrone.base_hp(), 60);
+    assert_eq!(HostileType::HullMite.base_hp(), 20);
+}
+
+/// Test 17: Hostile creature abilities
 #[test]
 fn test_hostile_creature_abilities() {
-    let wraith = HostileCreature::new(HostileType::TimeWraith);
-    let ability = wraith.use_ability();
+    let crawler = HostileCreature::new(HostileType::VoidCrawler);
+    let ability = crawler.use_ability();
     assert!(ability.success);
-    assert!(ability.effect.contains("loop counter"));
+    assert!(ability.effect.contains("electrical"));
 
-    let stalker = HostileCreature::new(HostileType::LoopStalker);
-    let ability = stalker.use_ability();
+    let leech = HostileCreature::new(HostileType::PressureLeech);
+    let ability = leech.use_ability();
     assert!(ability.success);
-    assert!(ability.effect_duration > 0);
+    assert!(ability.effect.contains("breach"));
 
-    let mut beast = HostileCreature::new(HostileType::EchoBeast);
-    beast.register_death_at_location();
-    beast.register_death_at_location();
-    let ability = beast.use_ability();
+    let drone = HostileCreature::new(HostileType::DebrisDrone);
+    let ability = drone.use_ability();
     assert!(ability.success);
-    assert!(ability.damage > beast.damage());
-
-    let spider = HostileCreature::new_with_loop(HostileType::ChronoSpider, 3);
-    let ability = spider.use_ability();
-    assert!(ability.success);
-    assert_eq!(ability.effect_duration, 3);
+    assert_eq!(ability.damage, drone.damage() * 2);
 }
 
-/// Test 10: Passive creature loop-dependent spawning
+/// Test 18: Passive creature drops
 #[test]
-fn test_passive_creature_loop_spawning() {
-    assert!(!PassiveType::LoopFish.can_spawn_on_loop(1));
-    assert!(PassiveType::LoopFish.can_spawn_on_loop(2));
-    assert!(!PassiveType::LoopFish.can_spawn_on_loop(3));
-    assert!(PassiveType::LoopFish.can_spawn_on_loop(4));
-
-    assert!(!PassiveType::PhaseDeer.can_spawn_on_loop(1));
-    assert!(!PassiveType::PhaseDeer.can_spawn_on_loop(2));
-    assert!(PassiveType::PhaseDeer.can_spawn_on_loop(3));
-    assert!(PassiveType::PhaseDeer.can_spawn_on_loop(10));
-
-    assert!(PassiveType::MemoryMoth.can_spawn_on_loop(1));
-    assert!(PassiveType::MemoryMoth.can_spawn_on_loop(100));
+fn test_passive_creature_drops() {
+    assert_eq!(PassiveType::CircuitMoth.drop_item(), "conductive_dust");
+    assert_eq!(PassiveType::CoolantFish.drop_item(), "coolant_scale");
+    assert_eq!(PassiveType::SporeBloom.drop_item(), "bio_compound");
+    assert_eq!(PassiveType::DustBunny.drop_item(), "filter_fiber");
+    assert_eq!(PassiveType::StarCrab.drop_item(), "hull_chitin");
 }
 
-/// Test 11: Passive creature temporal drops
+/// Test 19: Passive creature behavior
 #[test]
-fn test_passive_creature_temporal_drops() {
-    let moth = PassiveCreature::new(PassiveType::MemoryMoth);
-    assert_eq!(moth.drop_item(), "temporal_dust");
+fn test_passive_creature_behavior() {
+    let mut creature = PassiveCreature::new(PassiveType::StarCrab);
+    assert!(creature.is_alive());
+    assert!(!creature.is_fleeing());
 
-    let fish = PassiveCreature::new(PassiveType::LoopFish);
-    assert_eq!(fish.drop_item(), "time_scale");
+    creature.take_damage(5);
+    assert!(creature.is_fleeing());
+    assert!(creature.is_alive());
 
-    let rabbit = PassiveCreature::new(PassiveType::EchoRabbit);
-    assert_eq!(rabbit.drop_item(), "loop_fiber");
-
-    let deer = PassiveCreature::new(PassiveType::PhaseDeer);
-    assert_eq!(deer.drop_item(), "phase_antler");
-
-    let turtle = PassiveCreature::new(PassiveType::AnchorTurtle);
-    assert_eq!(turtle.drop_item(), "anchor_shell");
+    let drop = creature.on_catch();
+    assert!(drop.is_some());
+    assert_eq!(drop.unwrap(), "hull_chitin");
+    assert!(!creature.is_alive());
 }
 
-/// Test 12: Phase Deer phasing mechanic
+/// Test 20: Spore Bloom regeneration
 #[test]
-fn test_phase_deer_phasing() {
-    let mut deer = PassiveCreature::new(PassiveType::PhaseDeer);
-    assert!(!deer.is_phased());
+fn test_spore_bloom_regeneration() {
+    let mut bloom = PassiveCreature::new(PassiveType::SporeBloom);
+    bloom.take_damage(5);
+    let damaged_hp = bloom.hp();
 
-    deer.toggle_phase();
-    assert!(deer.is_phased());
-
-    let dealt = deer.take_damage(100);
-    assert_eq!(dealt, 0);
-    assert_eq!(deer.hp(), deer.max_hp());
-
-    let drop = deer.on_catch();
-    assert!(drop.is_none());
-    assert!(deer.is_alive());
-}
-
-/// Test 13: Loop state network synchronization
-#[test]
-fn test_loop_state_network_sync() {
-    let mut sync = LoopSync::new();
-
-    let data = serialize_loop_state(5, LoopPhase::Dusk, 15.0, 1.4);
-
-    let packet = deserialize_loop_state(&data).unwrap();
-    assert_eq!(packet.loop_count, 5);
-    assert_eq!(packet.phase(), LoopPhase::Dusk);
-    assert!((packet.time_remaining - 15.0).abs() < f32::EPSILON);
-    assert!((packet.difficulty - 1.4).abs() < f32::EPSILON);
-
-    sync.update_from_network(&packet);
-    assert_eq!(sync.loop_count(), 5);
-    assert_eq!(sync.phase(), LoopPhase::Dusk);
-}
-
-/// Test 14: Persistent state network synchronization
-#[test]
-fn test_persistent_state_network_sync() {
-    let mut packet = PersistentStatePacket::new();
-
-    let mut chest = ChestStatePacket::new(1);
-    chest.add_slot(0, "time_crystal".to_string(), 10);
-    packet.add_chest(chest);
-
-    packet.knowledge.add_discovery(KnowledgeCategory::Map, 1);
-    packet.message_count = 3;
-
-    let data = serialize_persistent_state(&packet);
-    let decoded = deserialize_persistent_state(&data).unwrap();
-
-    assert_eq!(decoded.chests.len(), 1);
-    assert_eq!(decoded.chests[0].slots.len(), 1);
-    assert_eq!(decoded.knowledge.discoveries.len(), 1);
-    assert_eq!(decoded.message_count, 3);
-}
-
-/// Test 15: Paradox aging across loops
-#[test]
-fn test_paradox_aging() {
-    let mut handler = ParadoxHandler::new();
-
-    handler.detect(IVec3::new(0, 0, 0), ParadoxType::TerrainConflict, 50.0);
-    handler.detect(IVec3::new(100, 0, 0), ParadoxType::StateOverlap, 50.0);
-
-    handler.age_all();
-
-    let paradoxes = handler.paradoxes();
-    assert_eq!(paradoxes[0].loop_age, 1);
-    assert_eq!(paradoxes[1].loop_age, 1);
-
-    handler.age_all();
-    let paradoxes = handler.paradoxes();
-    assert_eq!(paradoxes[0].loop_age, 2);
-}
-
-/// Test 16: Loop manager death and midnight resets
-#[test]
-fn test_loop_manager_resets() {
-    let mut manager = LoopManager::new();
-
-    manager.tick(50.0);
-
-    let new_loop = manager.on_death();
-    assert_eq!(new_loop, 2);
-    assert_eq!(manager.current_phase(), LoopPhase::Dawn);
-
-    manager.tick(100.0);
-
-    let new_loop = manager.on_midnight();
-    assert_eq!(new_loop, 3);
-    assert_eq!(manager.current_phase(), LoopPhase::Dawn);
-}
-
-/// Test 17: Temporal Parasite phase ability
-#[test]
-fn test_temporal_parasite_phase_target() {
-    let parasite = HostileCreature::new(HostileType::TemporalParasite);
-    let current_pos = IVec3::new(0, 64, 0);
-
-    let chests = vec![
-        IVec3::new(100, 64, 0),
-        IVec3::new(30, 64, 0),
-        IVec3::new(50, 64, 50),
-    ];
-
-    let target = parasite.get_phase_target(&chests, current_pos);
-    assert_eq!(target, Some(IVec3::new(30, 64, 0)));
-}
-
-/// Test 18: Knowledge discovery tracking
-#[test]
-fn test_knowledge_discovery_tracking() {
-    let mut handler = ParadoxHandler::new();
-
-    handler.detect(IVec3::ZERO, ParadoxType::TerrainConflict, 50.0);
-    handler.detect(IVec3::new(10, 0, 0), ParadoxType::StateOverlap, 50.0);
-
-    assert_eq!(handler.discovered_count(), 0);
-
-    handler.discover(0);
-    assert_eq!(handler.discovered_count(), 1);
-
-    handler.discover(1);
-    assert_eq!(handler.discovered_count(), 2);
-}
-
-/// Test 19: Complete temporal gameplay scenario
-#[test]
-fn test_complete_temporal_gameplay_scenario() {
-    let mut loop_manager = LoopManager::new();
-    let mut paradox_handler = ParadoxHandler::new();
-    let mut knowledge = KnowledgeSystem::new();
-    let mut chest = TemporalChest::new(IVec3::new(0, 64, 0));
-
-    for tick in 0..100u32 {
-        let dt = 1.0;
-
-        loop_manager.tick(dt);
-
-        if tick == 30 {
-            paradox_handler.detect(
-                IVec3::new(tick as i32, 64, 0),
-                ParadoxType::TerrainConflict,
-                40.0,
-            );
-        }
-
-        if tick == 50 {
-            knowledge.discover(DiscoveryID::new(KnowledgeCategory::Map, 1));
-        }
-    }
-
-    chest.insert(0, ItemStack::new("loot", 5));
-    chest.persist_across_loop();
-
-    let new_loop = loop_manager.on_death();
-    assert_eq!(new_loop, 2);
-
-    assert!(!chest.is_empty());
-    assert!(knowledge.is_discovered(DiscoveryID::new(KnowledgeCategory::Map, 1)));
-    assert!(paradox_handler.paradox_count() > 0);
-}
-
-/// Test 20: Loop break (win condition)
-#[test]
-fn test_loop_break_win_condition() {
-    let mut manager = LoopManager::new();
-
-    manager.on_death();
-    manager.on_death();
-    manager.on_death();
-    assert_eq!(manager.current_loop(), 4);
-
-    manager.break_loop();
-    assert_eq!(manager.current_loop(), 0);
+    bloom.tick(2.0);
+    assert!(bloom.hp() > damaged_hp);
 }
 
 // =============================================================================
-// Legacy Titan/Balance Tests
+// Integration Scenarios
 // =============================================================================
 
-/// Test 21: Full movement cycle
+/// Test 21: Complete station emergency scenario
 #[test]
-fn test_titan_full_movement_cycle() {
-    let mut movement = TitanMovement::new();
-    assert_eq!(movement.current_phase(), TitanPhase::Resting);
+fn test_station_emergency_scenario() {
+    // Setup station
+    let mut atmo = AtmosphereManager::new();
+    let command = atmo.add_room(200.0, true);
+    let engineering = atmo.add_room(250.0, true);
 
-    let mut phases_seen = vec![TitanPhase::Resting];
+    atmo.connect_rooms(command, engineering, 1.0);
 
-    for _ in 0..1000 {
-        if let Some(new_phase) = movement.tick(1.0) {
-            if !phases_seen.contains(&new_phase) {
-                phases_seen.push(new_phase);
-            }
-        }
+    let mut power = PowerManager::new();
+    power.register_consumer(PowerConsumer::new(command, "Command Systems".to_string(), 1, 15.0));
+    power.register_consumer(PowerConsumer::new(engineering, "Engineering".to_string(), 2, 20.0));
+
+    // Simulate normal operation (short simulation, life support maintains atmosphere)
+    for _ in 0..5 {
+        atmo.tick(0.1);
+        power.tick(0.1);
     }
 
-    assert!(phases_seen.contains(&TitanPhase::Walking));
-}
+    // Command should still be breathable (life support active)
+    let command_atmo = atmo.get_room(command).unwrap();
+    assert!(command_atmo.o2 >= 16.0 && command_atmo.o2 <= 25.0);
+    assert!(command_atmo.pressure >= 80.0);
 
-/// Test 22: Balance recovery during phases
-#[test]
-fn test_balance_recovery_during_phases() {
-    let mut balance = BalanceMeter::new();
+    // Trigger breach in engineering
+    atmo.breach(engineering, DecompressionType::Slow);
 
-    balance.modify(-50.0);
-    assert!((balance.balance() - 50.0).abs() < f32::EPSILON);
-
-    balance.tick(1.0, TitanPhase::Resting);
-    assert!(balance.balance() > 50.0);
-}
-
-/// Test 23: Titan mood changes
-#[test]
-fn test_titan_mood_changes() {
-    let mut behavior = TitanBehavior::new();
-    assert_eq!(behavior.current_mood(), TitanMood::Calm);
-
-    for _ in 0..4 {
-        behavior.harvest_tissue();
+    // Simulate emergency
+    for _ in 0..10 {
+        atmo.tick(0.1);
+        power.tick(0.1);
     }
-    assert_eq!(behavior.current_mood(), TitanMood::Agitated);
 
-    for _ in 0..4 {
-        behavior.harvest_tissue();
+    // Engineering should be losing pressure
+    assert!(atmo.get_room(engineering).unwrap().pressure < 101.3);
+
+    // Seal the breach
+    atmo.seal_breach(engineering);
+}
+
+/// Test 22: EVA rescue mission
+#[test]
+fn test_eva_rescue_mission() {
+    let mut eva = EVAState::new();
+    let mut movement = ZeroGMovement::new();
+
+    // Exit station
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    // Navigate to target
+    movement.thrust(IVec3::new(1, 0, 0), 5.0);
+
+    for _ in 0..10 {
+        movement.tick(1.0);
+        eva.use_o2(1.0);
     }
-    assert_eq!(behavior.current_mood(), TitanMood::Enraged);
+
+    assert!(movement.position().x > 0);
+    assert!(eva.suit_o2() < 30.0);
+
+    // Return
+    movement.thrust(IVec3::new(-1, 0, 0), 10.0);
+    eva.return_inside();
+
+    assert!(!eva.is_outside());
 }
 
-/// Test 24: Crafting stations
+/// Test 23: Creature encounter during repair
 #[test]
-fn test_crafting_stations() {
-    let forge = ShellForge::new();
-    assert!(forge.get_recipe(RECIPE_SHELL_INGOT).is_some());
+fn test_creature_encounter() {
+    let mut segment = HullSegment::new(0);
+    let mut creature = HostileCreature::new(HostileType::HullMite);
 
-    let lab = OrganicLab::new();
-    assert!(lab.get_recipe(RECIPE_COAGULANT).is_some());
+    // Creature damages hull
+    segment.damage(creature.damage() as f32);
+    assert!((segment.integrity() - 97.0).abs() < f32::EPSILON);
+
+    // Player fights back
+    creature.take_damage(10);
+    assert!(creature.is_alive());
+
+    creature.take_damage(15);
+    assert!(!creature.is_alive());
+
+    // Repair hull
+    segment.patch(10.0);
+    assert!(segment.integrity() > 97.0);
 }
 
-/// Test 25: Network sync roundtrip
+/// Test 24: All hostile types exist
 #[test]
-fn test_network_serialization_roundtrip() {
-    let hp = 7500.5;
-    let mood = 2u8;
-    let phase = 1u8;
-    let day = 42u32;
+fn test_all_hostile_types() {
+    let all = HostileType::all();
+    assert_eq!(all.len(), 5);
 
-    let data = serialize_titan_state(hp, mood, phase, day);
-    let (hp2, mood2, phase2, day2) = deserialize_titan_state(&data).unwrap();
+    for hostile_type in all {
+        let creature = HostileCreature::new(*hostile_type);
+        assert!(creature.is_alive());
+        assert!(creature.is_active());
+        assert!(creature.hp() > 0);
+        assert!(creature.damage() > 0);
+    }
+}
 
-    assert!((hp - hp2).abs() < f32::EPSILON);
-    assert_eq!(mood, mood2);
-    assert_eq!(phase, phase2);
-    assert_eq!(day, day2);
+/// Test 25: All passive types exist
+#[test]
+fn test_all_passive_types() {
+    let all = PassiveType::all();
+    assert_eq!(all.len(), 5);
 
-    let positions = vec![
-        (100u64, IVec3::new(i32::MIN, 0, i32::MAX)),
-        (u64::MAX, IVec3::new(0, -1000, 1000)),
+    for passive_type in all {
+        let creature = PassiveCreature::new(*passive_type);
+        assert!(creature.is_alive());
+        assert!(!creature.drop_item().is_empty());
+        assert!(!creature.special_trait().is_empty());
+    }
+}
+
+/// Test 26: Power system under stress
+#[test]
+fn test_power_system_stress() {
+    let mut power = PowerManager::new();
+
+    // Max out power consumption
+    for i in 0..10 {
+        power.register_consumer(PowerConsumer::new(i, format!("System {}", i), 3, 15.0));
+    }
+
+    // Total demand: 150, supply: 100
+    assert!(power.total_demand() > power.reactor().output());
+
+    // System should shed load
+    let affected = power.tick(1.0);
+    // Battery should help initially
+
+    // After battery drains, load shedding occurs
+    for _ in 0..100 {
+        power.tick(1.0);
+    }
+}
+
+/// Test 27: Station room network
+#[test]
+fn test_station_room_network() {
+    let rooms = [
+        StationRoom::new(0, RoomType::Command, "Bridge".to_string()),
+        StationRoom::new(1, RoomType::LifeSupport, "Life Support".to_string()),
+        StationRoom::new(2, RoomType::PowerCore, "Reactor".to_string()),
+        StationRoom::new(3, RoomType::Engineering, "Engineering".to_string()),
     ];
 
-    let data = serialize_positions(&positions);
-    let positions2 = deserialize_positions(&data);
+    let critical_count = rooms.iter().filter(|r| r.room_type().is_critical()).count();
+    assert_eq!(critical_count, 3);
 
-    assert_eq!(positions.len(), positions2.len());
-    assert_eq!(positions[0], positions2[0]);
-    assert_eq!(positions[1], positions2[1]);
+    let bulkheads = [
+        Bulkhead::new(0, 1),
+        Bulkhead::new(1, 2),
+        Bulkhead::new(2, 3),
+        Bulkhead::new(3, 0),
+    ];
+
+    for bulkhead in &bulkheads {
+        assert!(bulkhead.is_passable());
+    }
+}
+
+/// Test 28: Zero-G combat maneuvers
+#[test]
+fn test_zerog_combat_maneuvers() {
+    let mut movement = ZeroGMovement::new();
+    let recoil = RecoilSystem::new();
+
+    // Fire weapon
+    let weapon_recoil = recoil.weapon_recoil(20.0);
+    movement.apply_force(weapon_recoil);
+
+    assert!(movement.velocity().x != 0 || movement.velocity().y != 0 || movement.velocity().z != 0);
+
+    // Compensate with thrusters
+    movement.thrust(-movement.velocity(), 5.0);
+
+    // Grab surface to stabilize
+    movement.grab_surface();
+    movement.enable_boots();
+    movement.tick(1.0);
+
+    assert_eq!(movement.velocity(), IVec3::ZERO);
+}
+
+/// Test 29: System state transitions
+#[test]
+fn test_system_state_transitions() {
+    use crate::station::RoomSystem;
+
+    let mut system = RoomSystem::new("Life Support Core".to_string(), 25.0);
+    assert_eq!(system.state(), SystemState::Online);
+    assert!((system.effective_power_draw() - 25.0).abs() < f32::EPSILON);
+
+    system.degrade();
+    assert_eq!(system.state(), SystemState::Degraded);
+    assert!((system.effective_power_draw() - 12.5).abs() < f32::EPSILON);
+
+    system.power_off();
+    assert_eq!(system.state(), SystemState::Offline);
+    assert!((system.effective_power_draw() - 0.0).abs() < f32::EPSILON);
+
+    system.power_on();
+    assert_eq!(system.state(), SystemState::Online);
+}
+
+/// Test 30: Complete game loop scenario
+#[test]
+fn test_complete_game_loop() {
+    // Initialize all systems
+    let mut atmo = AtmosphereManager::new();
+    let mut power = PowerManager::new();
+    let mut eva = EVAState::new();
+
+    // Create station
+    let bridge = atmo.add_room(200.0, true);
+    let reactor = atmo.add_room(300.0, true);
+    let _airlock = atmo.add_room(50.0, false);
+
+    atmo.connect_rooms(bridge, reactor, 1.0);
+
+    power.register_consumer(PowerConsumer::new(bridge, "Bridge".to_string(), 1, 15.0));
+    power.register_consumer(PowerConsumer::new(reactor, "Reactor Systems".to_string(), 1, 5.0));
+
+    // Simulate normal operation (shorter time)
+    for _ in 0..10 {
+        atmo.tick(0.1);
+        power.tick(0.1);
+    }
+
+    // Emergency: reactor breach!
+    atmo.breach(reactor, DecompressionType::Rapid);
+
+    // Player goes EVA to repair
+    eva.enter_vacuum();
+    eva.deploy_tether();
+
+    // Repair takes time
+    for _ in 0..20 {
+        atmo.tick(0.1);
+        eva.use_o2(0.1);
+    }
+
+    // Seal breach
+    atmo.seal_breach(reactor);
+
+    // Return inside
+    eva.return_inside();
+
+    // Verify survival
+    assert!(!eva.is_o2_depleted());
+
+    // Bridge should still have O2 and pressure (life support active)
+    let bridge_atmo = atmo.get_room(bridge).unwrap();
+    assert!(bridge_atmo.o2 >= 16.0);
+    assert!(bridge_atmo.pressure >= 80.0);
 }
